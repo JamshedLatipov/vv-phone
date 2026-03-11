@@ -8,6 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use tracing::{info, warn, error};
 
+#[derive(Debug, Clone)]
 pub struct Call {
     pub id: String,
     pub state: CallState,
@@ -147,6 +148,28 @@ impl UserAgent {
         });
 
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
+        Ok(())
+    }
+
+    pub async fn hangup(&mut self, call_id: String, server_addr: SocketAddr) -> Result<()> {
+        if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+            let call = &self.active_calls[pos];
+            self.cseq += 1;
+            let local_addr = self.transport.local_addr()?.to_string();
+
+            let req = SipRequest::new(Method::Bye, &call.remote_uri)
+                .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-bye-{}", local_addr, Uuid::new_v4()))
+                .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
+                .with_header("To", &call.remote_uri)
+                .with_header("Call-ID", &call.id)
+                .with_header("CSeq", &format!("{} BYE", self.cseq))
+                .with_header("Max-Forwards", "70")
+                .with_header("Content-Length", "0");
+
+            self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
+            self.active_calls.remove(pos);
+            info!("Hung up call {}", call_id);
+        }
         Ok(())
     }
 }
