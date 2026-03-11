@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let transport: Arc<dyn SipTransport> = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
     info!("SIP UDP Transport bound to 0.0.0.0:5060");
 
-    let account = config.accounts.first().cloned().unwrap_or_else(|| {
+    let initial_account = config.accounts.first().cloned().unwrap_or_else(|| {
         info!("No account configured, using placeholder.");
         softphone::core::Account {
             name: "Default".to_string(),
@@ -49,21 +49,22 @@ async fn main() -> anyhow::Result<()> {
     let active_calls = Arc::new(Mutex::new(Vec::<Call>::new()));
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    let mut ua = UserAgent::new(account.clone(), transport.clone());
+    let mut ua = UserAgent::new(initial_account.clone(), transport.clone());
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
-    let server_domain = account.domain.clone();
 
     // Background task for SIP UserAgent logic and command handling
     tokio::spawn(async move {
-        let server_addr = format!("{}:5060", server_domain)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next());
-
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                UiCommand::Register => {
+                UiCommand::Register(account) => {
+                    ua.account = account.clone();
+                    let server_domain = account.domain.clone();
+                    let server_addr = format!("{}:5060", server_domain)
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut addrs| addrs.next());
+
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.register(addr).await {
                             error!("Registration error: {}", e);
@@ -71,10 +72,18 @@ async fn main() -> anyhow::Result<()> {
                         let mut state = reg_state_clone.lock().unwrap();
                         *state = ua.reg_state.clone();
                     } else {
-                        error!("Could not resolve server address");
+                        error!("Could not resolve server address for {}", server_domain);
+                        let mut state = reg_state_clone.lock().unwrap();
+                        *state = RegistrationState::Failed(format!("DNS resolution failed for {}", server_domain));
                     }
                 }
                 UiCommand::Invite(uri) => {
+                    let server_domain = ua.account.domain.clone();
+                    let server_addr = format!("{}:5060", server_domain)
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut addrs| addrs.next());
+
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.invite(&uri, addr).await {
                             error!("Invite error: {}", e);
@@ -84,6 +93,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UiCommand::Hangup(id) => {
+                    let server_domain = ua.account.domain.clone();
+                    let server_addr = format!("{}:5060", server_domain)
+                        .to_socket_addrs()
+                        .ok()
+                        .and_then(|mut addrs| addrs.next());
+
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.hangup(id, addr).await {
                             error!("Hangup error: {}", e);
@@ -99,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.ui {
         info!("Launching UI...");
         let native_options = eframe::NativeOptions::default();
-        let app = SoftphoneApp::new(cmd_tx, reg_state, active_calls);
+        let app = SoftphoneApp::new(initial_account, cmd_tx, reg_state, active_calls);
         eframe::run_native(
             "Softphone",
             native_options,
@@ -107,8 +122,6 @@ async fn main() -> anyhow::Result<()> {
         ).map_err(|e| anyhow::anyhow!("Eframe error: {}", e))?;
     } else {
         info!("Headless mode: Use --ui to launch the graphical interface.");
-        // Keep the main task alive for headless if needed, but for now we just exit
-        // unless we want to implement some CLI interaction here.
     }
 
     Ok(())
