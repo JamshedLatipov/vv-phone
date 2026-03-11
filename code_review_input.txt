@@ -1,5 +1,0 @@
-I have implemented a settings panel in the softphone application.
-Changes:
-1. Updated `src/config/mod.rs` to include connection settings (bind address and transport type).
-2. Updated `src/ui/mod.rs` to add UI elements for account and connection settings, and a "Save & Register" button.
-3. Updated `src/main.rs` to initialize transport from config and handle `UiCommand::SaveConfig` to save settings to `config.toml`.
