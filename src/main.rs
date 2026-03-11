@@ -1,11 +1,14 @@
 use softphone::config::Config;
 use softphone::sip::transport::{SipUdpTransport, SipTransport};
-use softphone::sip::ua::UserAgent;
+use softphone::sip::ua::{UserAgent, RegistrationState, Call};
 use softphone::cli::Cli;
+use softphone::ui::{SoftphoneApp, UiCommand};
 use clap::Parser;
-use std::sync::Arc;
-use tracing::{info, Level};
+use std::sync::{Arc, Mutex};
+use std::net::ToSocketAddrs;
+use tracing::{info, Level, error};
 use tracing_subscriber::FmtSubscriber;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,7 +22,6 @@ async fn main() -> anyhow::Result<()> {
         .expect("setting default subscriber failed");
 
     info!("Starting Softphone...");
-    info!("Options: {:?}", cli);
 
     let config_path = "config.toml";
     let config = if std::path::Path::new(config_path).exists() {
@@ -29,23 +31,84 @@ async fn main() -> anyhow::Result<()> {
         Config::default()
     };
 
-    info!("Accounts found: {}", config.accounts.len());
-
     let transport: Arc<dyn SipTransport> = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
     info!("SIP UDP Transport bound to 0.0.0.0:5060");
 
-    if let Some(account) = config.accounts.first() {
-        info!("Initializing UserAgent for account: {}", account.name);
-        let _ua = UserAgent::new(account.clone(), transport.clone());
-
-        // For headless mode, we might want to register and wait
-        if !cli.ui {
-            info!("Headless mode: UserAgent initialized.");
+    let account = config.accounts.first().cloned().unwrap_or_else(|| {
+        info!("No account configured, using placeholder.");
+        softphone::core::Account {
+            name: "Default".to_string(),
+            username: "user".to_string(),
+            domain: "example.com".to_string(),
+            password: Some("pass".to_string()),
+            proxy: None,
         }
-    }
+    });
+
+    let reg_state = Arc::new(Mutex::new(RegistrationState::Unregistered));
+    let active_calls = Arc::new(Mutex::new(Vec::<Call>::new()));
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+
+    let mut ua = UserAgent::new(account.clone(), transport.clone());
+    let reg_state_clone = reg_state.clone();
+    let active_calls_clone = active_calls.clone();
+    let server_domain = account.domain.clone();
+
+    // Background task for SIP UserAgent logic and command handling
+    tokio::spawn(async move {
+        let server_addr = format!("{}:5060", server_domain)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| addrs.next());
+
+        while let Some(cmd) = cmd_rx.recv().await {
+            match cmd {
+                UiCommand::Register => {
+                    if let Some(addr) = server_addr {
+                        if let Err(e) = ua.register(addr).await {
+                            error!("Registration error: {}", e);
+                        }
+                        let mut state = reg_state_clone.lock().unwrap();
+                        *state = ua.reg_state.clone();
+                    } else {
+                        error!("Could not resolve server address");
+                    }
+                }
+                UiCommand::Invite(uri) => {
+                    if let Some(addr) = server_addr {
+                        if let Err(e) = ua.invite(&uri, addr).await {
+                            error!("Invite error: {}", e);
+                        }
+                        let mut calls = active_calls_clone.lock().unwrap();
+                        *calls = ua.active_calls.clone();
+                    }
+                }
+                UiCommand::Hangup(id) => {
+                    if let Some(addr) = server_addr {
+                        if let Err(e) = ua.hangup(id, addr).await {
+                            error!("Hangup error: {}", e);
+                        }
+                        let mut calls = active_calls_clone.lock().unwrap();
+                        *calls = ua.active_calls.clone();
+                    }
+                }
+            }
+        }
+    });
 
     if cli.ui {
-        info!("UI mode requested but not supported in this build.");
+        info!("Launching UI...");
+        let native_options = eframe::NativeOptions::default();
+        let app = SoftphoneApp::new(cmd_tx, reg_state, active_calls);
+        eframe::run_native(
+            "Softphone",
+            native_options,
+            Box::new(|_cc| Ok(Box::new(app))),
+        ).map_err(|e| anyhow::anyhow!("Eframe error: {}", e))?;
+    } else {
+        info!("Headless mode: Use --ui to launch the graphical interface.");
+        // Keep the main task alive for headless if needed, but for now we just exit
+        // unless we want to implement some CLI interaction here.
     }
 
     Ok(())
