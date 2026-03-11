@@ -3,6 +3,7 @@ use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage};
 use crate::sip::transport::SipTransport;
 use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop};
 use anyhow::{Result, anyhow};
+use tokio::time::{timeout, Duration};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -65,7 +66,13 @@ impl UserAgent {
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
         let mut buf = [0u8; 4096];
-        let (len, _addr) = self.transport.recv_from(&mut buf).await?;
+        let (len, _addr) = match timeout(Duration::from_secs(5), self.transport.recv_from(&mut buf)).await {
+            Ok(res) => res?,
+            Err(_) => {
+                self.reg_state = RegistrationState::Failed("Timeout waiting for response".to_string());
+                return Err(anyhow!("Timeout waiting for response"));
+            }
+        };
         let resp_str = String::from_utf8_lossy(&buf[..len]);
 
         if let Some(SipMessage::Response(res)) = SipMessage::parse(&resp_str) {
@@ -104,7 +111,13 @@ impl UserAgent {
 
                     self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
 
-                    let (len, _addr) = self.transport.recv_from(&mut buf).await?;
+                    let (len, _addr) = match timeout(Duration::from_secs(5), self.transport.recv_from(&mut buf)).await {
+                        Ok(res) => res?,
+                        Err(_) => {
+                            self.reg_state = RegistrationState::Failed("Timeout waiting for auth response".to_string());
+                            return Err(anyhow!("Timeout waiting for auth response"));
+                        }
+                    };
                     let resp_str = String::from_utf8_lossy(&buf[..len]);
                     if let Some(SipMessage::Response(final_res)) = SipMessage::parse(&resp_str) {
                         if final_res.status_code == 200 {

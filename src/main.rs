@@ -69,11 +69,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 UiCommand::Register(account) => {
                     ua.account = account.clone();
-                    let server_domain = account.domain.clone();
-                    let server_addr = format!("{}:5060", server_domain)
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut addrs| addrs.next());
+                    let target = account.proxy.as_ref().unwrap_or(&account.domain);
+                    let server_addr = if target.contains(':') {
+                        target.to_socket_addrs().ok()
+                    } else {
+                        format!("{}:5060", target).to_socket_addrs().ok()
+                    }.and_then(|mut addrs| addrs.next());
 
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.register(addr).await {
@@ -82,17 +83,18 @@ async fn main() -> anyhow::Result<()> {
                         let mut state = reg_state_clone.lock().unwrap();
                         *state = ua.reg_state.clone();
                     } else {
-                        error!("Could not resolve server address for {}", server_domain);
+                        error!("Could not resolve server address for {}", target);
                         let mut state = reg_state_clone.lock().unwrap();
-                        *state = RegistrationState::Failed(format!("DNS resolution failed for {}", server_domain));
+                        *state = RegistrationState::Failed(format!("DNS resolution failed for {}", target));
                     }
                 }
                 UiCommand::Invite(uri) => {
-                    let server_domain = ua.account.domain.clone();
-                    let server_addr = format!("{}:5060", server_domain)
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut addrs| addrs.next());
+                    let target = ua.account.proxy.as_ref().unwrap_or(&ua.account.domain);
+                    let server_addr = if target.contains(':') {
+                        target.to_socket_addrs().ok()
+                    } else {
+                        format!("{}:5060", target).to_socket_addrs().ok()
+                    }.and_then(|mut addrs| addrs.next());
 
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.invite(&uri, addr).await {
@@ -103,11 +105,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UiCommand::Hangup(id) => {
-                    let server_domain = ua.account.domain.clone();
-                    let server_addr = format!("{}:5060", server_domain)
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut addrs| addrs.next());
+                    let target = ua.account.proxy.as_ref().unwrap_or(&ua.account.domain);
+                    let server_addr = if target.contains(':') {
+                        target.to_socket_addrs().ok()
+                    } else {
+                        format!("{}:5060", target).to_socket_addrs().ok()
+                    }.and_then(|mut addrs| addrs.next());
 
                     if let Some(addr) = server_addr {
                         if let Err(e) = ua.hangup(id, addr).await {
