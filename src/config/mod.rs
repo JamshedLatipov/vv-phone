@@ -3,9 +3,37 @@ use std::fs;
 use anyhow::Result;
 use crate::core::Account;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransportType {
+    Udp,
+    Tcp,
+}
+
+impl Default for TransportType {
+    fn default() -> Self {
+        TransportType::Udp
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionSettings {
+    pub bind_address: String,
+    pub transport_type: TransportType,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            bind_address: "0.0.0.0:5060".to_string(),
+            transport_type: TransportType::Udp,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub accounts: Vec<Account>,
+    pub connection: ConnectionSettings,
 }
 
 impl Config {
