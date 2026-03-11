@@ -1,7 +1,9 @@
 use softphone::config::Config;
 use softphone::sip::transport::SipUdpTransport;
+use softphone::sip::ua::UserAgent;
 use softphone::cli::Cli;
 use clap::Parser;
+use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -27,15 +29,23 @@ async fn main() -> anyhow::Result<()> {
         Config::default()
     };
 
-    info!("Accounts: {:?}", config.accounts);
+    info!("Accounts found: {}", config.accounts.len());
 
-    let _transport = SipUdpTransport::new("0.0.0.0:5060").await?;
+    let transport = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
     info!("SIP UDP Transport bound to 0.0.0.0:5060");
+
+    if let Some(account) = config.accounts.first() {
+        info!("Initializing UserAgent for account: {}", account.name);
+        let _ua = UserAgent::new(account.clone(), transport.clone());
+
+        // For headless mode, we might want to register and wait
+        if !cli.ui {
+            info!("Headless mode: UserAgent initialized.");
+        }
+    }
 
     if cli.ui {
         info!("UI mode requested but not supported in this build.");
-    } else {
-        info!("Softphone started in headless mode for account: {}", cli.account);
     }
 
     Ok(())
