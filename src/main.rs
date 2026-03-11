@@ -1,5 +1,5 @@
-use softphone::config::Config;
-use softphone::sip::transport::{SipUdpTransport, SipTransport};
+use softphone::config::{Config, TransportType};
+use softphone::sip::transport::{SipUdpTransport, SipTcpTransport, SipTransport};
 use softphone::sip::ua::{UserAgent, RegistrationState, Call};
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
@@ -31,8 +31,11 @@ async fn main() -> anyhow::Result<()> {
         Config::default()
     };
 
-    let transport: Arc<dyn SipTransport> = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
-    info!("SIP UDP Transport bound to 0.0.0.0:5060");
+    let transport: Arc<dyn SipTransport> = match config.connection.transport_type {
+        TransportType::Udp => Arc::new(SipUdpTransport::new(&config.connection.bind_address).await?),
+        TransportType::Tcp => Arc::new(SipTcpTransport::new(&config.connection.bind_address).await?),
+    };
+    info!("SIP {:?} Transport bound to {}", config.connection.transport_type, config.connection.bind_address);
 
     let initial_account = config.accounts.first().cloned().unwrap_or_else(|| {
         info!("No account configured, using placeholder.");
@@ -57,6 +60,13 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
+                UiCommand::SaveConfig(new_config) => {
+                    if let Err(e) = new_config.save_to_file("config.toml") {
+                        error!("Failed to save config: {}", e);
+                    } else {
+                        info!("Configuration saved to config.toml");
+                    }
+                }
                 UiCommand::Register(account) => {
                     ua.account = account.clone();
                     let server_domain = account.domain.clone();
@@ -114,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.ui {
         info!("Launching UI...");
         let native_options = eframe::NativeOptions::default();
-        let app = SoftphoneApp::new(initial_account, cmd_tx, reg_state, active_calls);
+        let app = SoftphoneApp::new(config, cmd_tx, reg_state, active_calls);
         eframe::run_native(
             "Softphone",
             native_options,

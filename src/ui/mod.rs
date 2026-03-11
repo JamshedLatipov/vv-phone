@@ -2,11 +2,13 @@ use eframe::egui;
 use crate::sip::ua::{RegistrationState, Call};
 use std::sync::{Arc, Mutex};
 use crate::core::Account;
+use crate::config::{Config, TransportType, ConnectionSettings};
 
 pub enum UiCommand {
     Register(Account),
     Invite(String),
     Hangup(String),
+    SaveConfig(Config),
 }
 
 pub struct SoftphoneApp {
@@ -14,6 +16,8 @@ pub struct SoftphoneApp {
     pub account_username: String,
     pub account_domain: String,
     pub account_password: String,
+    pub bind_address: String,
+    pub transport_type: TransportType,
     pub dialer_input: String,
     pub call_history: Vec<String>,
     pub reg_state: Arc<Mutex<RegistrationState>>,
@@ -39,6 +43,9 @@ impl eframe::App for SoftphoneApp {
                 ui.separator();
                 ui.add_space(10.0);
 
+                ui.label(egui::RichText::new("Account").strong());
+                ui.add_space(5.0);
+
                 ui.label("Account Name");
                 ui.text_edit_singleline(&mut self.account_name);
                 ui.add_space(5.0);
@@ -53,9 +60,28 @@ impl eframe::App for SoftphoneApp {
 
                 ui.label("Password");
                 ui.add(egui::TextEdit::singleline(&mut self.account_password).password(true));
+                ui.add_space(10.0);
+
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Connection").strong());
+                ui.add_space(5.0);
+
+                ui.label("Bind Address");
+                ui.text_edit_singleline(&mut self.bind_address);
+                ui.add_space(5.0);
+
+                ui.label("Transport");
+                egui::ComboBox::from_label("")
+                    .selected_text(format!("{:?}", self.transport_type))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.transport_type, TransportType::Udp, "UDP");
+                        ui.selectable_value(&mut self.transport_type, TransportType::Tcp, "TCP");
+                    });
+
                 ui.add_space(15.0);
 
-                if ui.add(egui::Button::new(egui::RichText::new("Update & Register").strong())
+                if ui.add(egui::Button::new(egui::RichText::new("Save & Register").strong())
                     .min_size(egui::vec2(ui.available_width(), 30.0)))
                     .clicked()
                 {
@@ -66,6 +92,16 @@ impl eframe::App for SoftphoneApp {
                         password: Some(self.account_password.clone()),
                         proxy: None,
                     };
+
+                    let config = Config {
+                        accounts: vec![account.clone()],
+                        connection: ConnectionSettings {
+                            bind_address: self.bind_address.clone(),
+                            transport_type: self.transport_type.clone(),
+                        },
+                    };
+
+                    let _ = self.command_sender.send(UiCommand::SaveConfig(config));
                     let _ = self.command_sender.send(UiCommand::Register(account));
                 }
 
@@ -98,16 +134,28 @@ impl eframe::App for SoftphoneApp {
 
 impl SoftphoneApp {
     pub fn new(
-        initial_account: Account,
+        initial_config: Config,
         command_sender: tokio::sync::mpsc::UnboundedSender<UiCommand>,
         reg_state: Arc<Mutex<RegistrationState>>,
         active_calls: Arc<Mutex<Vec<Call>>>,
     ) -> Self {
+        let initial_account = initial_config.accounts.first().cloned().unwrap_or_else(|| {
+            Account {
+                name: "Default".to_string(),
+                username: "user".to_string(),
+                domain: "example.com".to_string(),
+                password: Some("pass".to_string()),
+                proxy: None,
+            }
+        });
+
         Self {
             account_name: initial_account.name,
             account_username: initial_account.username,
             account_domain: initial_account.domain,
             account_password: initial_account.password.unwrap_or_default(),
+            bind_address: initial_config.connection.bind_address,
+            transport_type: initial_config.connection.transport_type,
             dialer_input: String::new(),
             call_history: Vec::new(),
             reg_state,
