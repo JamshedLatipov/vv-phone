@@ -87,6 +87,58 @@ impl RtpPacket {
     }
 }
 
+// RTCP Basic Structures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RtcpPacketType {
+    SenderReport = 200,
+    ReceiverReport = 201,
+    SourceDescription = 202,
+    Bye = 203,
+    App = 204,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtcpHeader {
+    pub version: u8,
+    pub padding: bool,
+    pub count: u8,
+    pub packet_type: RtcpPacketType,
+    pub length: u16,
+}
+
+impl RtcpHeader {
+    pub fn to_bytes(&self) -> [u8; 4] {
+        let first_byte = (self.version << 6) | ((self.padding as u8) << 5) | (self.count & 0x1F);
+        let second_byte = self.packet_type.clone() as u8;
+        let mut bytes = [0u8; 4];
+        bytes[0] = first_byte;
+        bytes[1] = second_byte;
+        bytes[2..4].copy_from_slice(&self.length.to_be_bytes());
+        bytes
+    }
+}
+
+pub struct RtcpSenderReport {
+    pub header: RtcpHeader,
+    pub ssrc: u32,
+    pub ntp_timestamp: u64,
+    pub rtp_timestamp: u32,
+    pub packet_count: u32,
+    pub byte_count: u32,
+}
+
+impl RtcpSenderReport {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.header.to_bytes().to_vec();
+        bytes.extend_from_slice(&self.ssrc.to_be_bytes());
+        bytes.extend_from_slice(&self.ntp_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.rtp_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.packet_count.to_be_bytes());
+        bytes.extend_from_slice(&self.byte_count.to_be_bytes());
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +158,27 @@ mod tests {
         assert_eq!(parsed.header.sequence_number, 100);
         assert_eq!(parsed.header.ssrc, 12345);
         assert_eq!(parsed.payload, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn test_rtcp_sr_serialization() {
+        let header = RtcpHeader {
+            version: 2,
+            padding: false,
+            count: 0,
+            packet_type: RtcpPacketType::SenderReport,
+            length: 6, // 28 bytes total
+        };
+        let sr = RtcpSenderReport {
+            header,
+            ssrc: 12345,
+            ntp_timestamp: 0x12345678,
+            rtp_timestamp: 1000,
+            packet_count: 10,
+            byte_count: 160,
+        };
+        let bytes = sr.to_bytes();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(bytes[1], 200);
     }
 }

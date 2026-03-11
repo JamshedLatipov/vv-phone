@@ -1,11 +1,6 @@
-pub mod auth;
-pub mod ua;
-pub mod transport;
-
 use std::fmt;
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
     Invite,
     Ack,
@@ -103,6 +98,13 @@ pub trait SipHeaderAccess {
             .map(|(_, v)| v)
     }
 
+    fn get_all_headers(&self, name: &str) -> Vec<&String> {
+        self.get_headers().iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+            .collect()
+    }
+
     fn set_header(&mut self, name: &str, value: &str) {
         if let Some(pos) = self.get_headers().iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
             self.get_headers_mut()[pos].1 = value.to_string();
@@ -111,12 +113,17 @@ pub trait SipHeaderAccess {
         }
     }
 
+    fn add_header(&mut self, name: &str, value: &str) {
+        self.get_headers_mut().push((name.to_string(), value.to_string()));
+    }
+
     fn via(&self) -> Option<&String> { self.get_header("Via") }
     fn from(&self) -> Option<&String> { self.get_header("From") }
     fn to(&self) -> Option<&String> { self.get_header("To") }
     fn call_id(&self) -> Option<&String> { self.get_header("Call-ID") }
     fn cseq(&self) -> Option<&String> { self.get_header("CSeq") }
     fn contact(&self) -> Option<&String> { self.get_header("Contact") }
+    fn p_access_network_info(&self) -> Option<&String> { self.get_header("P-Access-Network-Info") }
     fn content_length(&self) -> Option<usize> {
         self.get_header("Content-Length").and_then(|v| v.parse().ok())
     }
@@ -263,6 +270,10 @@ impl SipMessage {
     }
 }
 
+pub mod auth;
+pub mod transport;
+pub mod ua;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +299,25 @@ mod tests {
 
         req.set_header("Content-Length", "10");
         assert_eq!(req.content_length().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_duplicate_headers() {
+        let mut req = SipRequest::new(Method::Invite, "sip:alice@atlanta.com");
+        req.add_header("Via", "SIP/2.0/UDP 127.0.0.1:5060");
+        req.add_header("Via", "SIP/2.0/UDP 192.168.1.1:5060");
+
+        let vias = req.get_all_headers("Via");
+        assert_eq!(vias.len(), 2);
+        assert_eq!(vias[0], "SIP/2.0/UDP 127.0.0.1:5060");
+        assert_eq!(vias[1], "SIP/2.0/UDP 192.168.1.1:5060");
+    }
+
+    #[test]
+    fn test_p_access_network_info() {
+        let req = SipRequest::new(Method::Register, "sip:server.com")
+            .with_header("P-Access-Network-Info", "3GPP-UTRAN-TDD; utran-cell-id-3gpp=234151D0FCE11");
+        assert_eq!(req.p_access_network_info().unwrap(), "3GPP-UTRAN-TDD; utran-cell-id-3gpp=234151D0FCE11");
     }
 
     #[test]

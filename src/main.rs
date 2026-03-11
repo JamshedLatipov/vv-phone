@@ -1,5 +1,5 @@
 use softphone::config::Config;
-use softphone::sip::transport::SipUdpTransport;
+use softphone::sip::transport::{SipUdpTransport, SipTransport};
 use softphone::sip::ua::UserAgent;
 use softphone::cli::Cli;
 use clap::Parser;
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Accounts found: {}", config.accounts.len());
 
-    let transport = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
+    let transport: Arc<dyn SipTransport> = Arc::new(SipUdpTransport::new("0.0.0.0:5060").await?);
     info!("SIP UDP Transport bound to 0.0.0.0:5060");
 
     if let Some(account) = config.accounts.first() {

@@ -1,11 +1,12 @@
 use crate::core::{Account, CallState};
 use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage};
-use crate::sip::transport::SipUdpTransport;
-use crate::sip::auth::calculate_digest_response;
+use crate::sip::transport::SipTransport;
+use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop};
 use anyhow::{Result, anyhow};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
+use tracing::{info, warn, error};
 
 pub struct Call {
     pub id: String,
@@ -13,64 +14,111 @@ pub struct Call {
     pub remote_uri: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationState {
+    Unregistered,
+    Registering,
+    Registered,
+    Failed(String),
+}
+
 pub struct UserAgent {
     pub account: Account,
-    pub transport: Arc<SipUdpTransport>,
+    pub transport: Arc<dyn SipTransport>,
     pub call_id: String,
     pub cseq: u32,
-    pub active_call: Option<Call>,
+    pub active_calls: Vec<Call>,
+    pub reg_state: RegistrationState,
 }
 
 impl UserAgent {
-    pub fn new(account: Account, transport: Arc<SipUdpTransport>) -> Self {
+    pub fn new(account: Account, transport: Arc<dyn SipTransport>) -> Self {
         Self {
             account,
             transport,
             call_id: Uuid::new_v4().to_string(),
             cseq: 1,
-            active_call: None,
+            active_calls: Vec::new(),
+            reg_state: RegistrationState::Unregistered,
         }
     }
 
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
+        self.reg_state = RegistrationState::Registering;
+        info!("Registration started for {}", self.account.username);
+
         let uri = format!("sip:{}", self.account.domain);
+        let local_addr = self.transport.local_addr()?.to_string();
+
         let req = SipRequest::new(Method::Register, &uri)
-            .with_header("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-register")
+            .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-register-{}", local_addr, Uuid::new_v4()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", &format!("<sip:{}@{}>", self.account.username, self.account.domain))
             .with_header("Call-ID", &self.call_id)
             .with_header("CSeq", &format!("{} REGISTER", self.cseq))
-            .with_header("Contact", &format!("<sip:{}@127.0.0.1:5060>", self.account.username))
+            .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Max-Forwards", "70")
+            .with_header("Expires", "3600")
             .with_header("Content-Length", "0");
 
-        let data = req.to_string();
-        self.transport.send_to(data.as_bytes(), server_addr).await?;
+        self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
-        // Simplified registration flow for skeleton
         let mut buf = [0u8; 4096];
         let (len, _addr) = self.transport.recv_from(&mut buf).await?;
         let resp_str = String::from_utf8_lossy(&buf[..len]);
 
         if let Some(SipMessage::Response(res)) = SipMessage::parse(&resp_str) {
-            if res.status_code == 401 {
-                // Handle challenge
-                let authenticate = res.get_header("WWW-Authenticate").ok_or_else(|| anyhow!("Missing WWW-Authenticate"))?;
-                // Parse realm and nonce (simplified)
-                let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
-                let nonce = authenticate.split("nonce=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+            match res.status_code {
+                200 => {
+                    self.reg_state = RegistrationState::Registered;
+                    info!("Registered successfully");
+                }
+                401 | 407 => {
+                    let auth_header_name = if res.status_code == 401 { "WWW-Authenticate" } else { "Proxy-Authenticate" };
+                    let authenticate = res.get_header(auth_header_name).ok_or_else(|| anyhow!("Missing Authentication header"))?;
 
-                let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
-                let response = calculate_digest_response(&self.account.username, password, realm, nonce, "REGISTER", &uri);
+                    let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                    let nonce = authenticate.split("nonce=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                    let qop = authenticate.split("qop=\"").nth(1).and_then(|s| s.split('\"').next());
 
-                self.cseq += 1;
-                let auth_header = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\"",
-                    self.account.username, realm, nonce, uri, response);
+                    let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
 
-                let auth_req = req.with_header("CSeq", &format!("{} REGISTER", self.cseq))
-                    .with_header("Authorization", &auth_header);
+                    let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
+                        self.account.username, realm, nonce, uri);
 
-                self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
+                    if let Some(_q) = qop.filter(|&q| q.contains("auth")) {
+                        let cnonce = Uuid::new_v4().to_string()[..8].to_string();
+                        let nc = "00000001";
+                        let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", "REGISTER", &uri);
+                        auth_val.push_str(&format!(", qop=\"auth\", nc={}, cnonce=\"{}\", response=\"{}\"", nc, cnonce, response));
+                    } else {
+                        let response = calculate_digest_response(&self.account.username, password, realm, nonce, "REGISTER", &uri);
+                        auth_val.push_str(&format!(", response=\"{}\"", response));
+                    }
+
+                    self.cseq += 1;
+                    let auth_req = req.clone()
+                        .with_header("CSeq", &format!("{} REGISTER", self.cseq))
+                        .with_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+
+                    self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
+
+                    let (len, _addr) = self.transport.recv_from(&mut buf).await?;
+                    let resp_str = String::from_utf8_lossy(&buf[..len]);
+                    if let Some(SipMessage::Response(final_res)) = SipMessage::parse(&resp_str) {
+                        if final_res.status_code == 200 {
+                            self.reg_state = RegistrationState::Registered;
+                            info!("Registered successfully (with auth)");
+                        } else {
+                            self.reg_state = RegistrationState::Failed(format!("Status {}", final_res.status_code));
+                            error!("Registration failed with status {}", final_res.status_code);
+                        }
+                    }
+                }
+                _ => {
+                    self.reg_state = RegistrationState::Failed(format!("Status {}", res.status_code));
+                    warn!("Registration failed with status {}", res.status_code);
+                }
             }
         }
 
@@ -80,19 +128,19 @@ impl UserAgent {
     pub async fn invite(&mut self, remote_uri: &str, server_addr: SocketAddr) -> Result<()> {
         let call_id = Uuid::new_v4().to_string();
         self.cseq += 1;
+        let local_addr = self.transport.local_addr()?.to_string();
 
         let req = SipRequest::new(Method::Invite, remote_uri)
-            .with_header("Via", "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-invite")
+            .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-invite-{}", local_addr, Uuid::new_v4()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", remote_uri)
             .with_header("Call-ID", &call_id)
             .with_header("CSeq", &format!("{} INVITE", self.cseq))
-            .with_header("Contact", &format!("<sip:{}@127.0.0.1:5060>", self.account.username))
+            .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Content-Type", "application/sdp")
             .with_header("Max-Forwards", "70");
 
-        // For skeleton, we'll just transition to Calling state
-        self.active_call = Some(Call {
+        self.active_calls.push(Call {
             id: call_id,
             state: CallState::Calling,
             remote_uri: remote_uri.to_string(),
