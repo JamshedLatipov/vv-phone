@@ -47,8 +47,11 @@ impl Default for AudioSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
     pub accounts: Vec<Account>,
+    #[serde(default)]
     pub connection: ConnectionSettings,
+    #[serde(default)]
     pub audio: AudioSettings,
 }
 
@@ -63,5 +66,19 @@ impl Config {
         let content = toml::to_string(self)?;
         fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_deserialization_defaults() {
+        let toml_str = "[[accounts]]\nname = \"test\"\nusername = \"user\"\ndomain = \"127.0.0.1\"";
+        let config: Config = toml::from_str(toml_str).expect("Should parse with defaults");
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.connection.bind_address, "0.0.0.0:5060");
+        assert!(config.audio.input_device.is_none());
     }
 }
