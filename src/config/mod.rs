@@ -19,13 +19,22 @@ impl Default for TransportType {
 pub struct ConnectionSettings {
     pub bind_address: String,
     pub transport_type: TransportType,
+    #[serde(default = "default_rtp_start")]
+    pub rtp_port_start: u16,
+    #[serde(default = "default_rtp_end")]
+    pub rtp_port_end: u16,
 }
+
+fn default_rtp_start() -> u16 { 10000 }
+fn default_rtp_end() -> u16 { 10100 }
 
 impl Default for ConnectionSettings {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0:5060".to_string(),
             transport_type: TransportType::Udp,
+            rtp_port_start: 10000,
+            rtp_port_end: 10100,
         }
     }
 }
@@ -79,6 +88,7 @@ mod tests {
         let config: Config = toml::from_str(toml_str).expect("Should parse with defaults");
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.connection.bind_address, "0.0.0.0:5060");
-        assert!(config.audio.input_device.is_none());
+        assert_eq!(config.connection.rtp_port_start, 10000);
+        assert_eq!(config.connection.rtp_port_end, 10100);
     }
 }

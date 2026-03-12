@@ -62,7 +62,11 @@ async fn main() -> anyhow::Result<()> {
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    let ua = Arc::new(TokioMutex::new(UserAgent::new(initial_account.clone(), transport.clone())));
+    let mut user_agent = UserAgent::new(initial_account.clone(), transport.clone());
+    user_agent.rtp_port_start = config.connection.rtp_port_start;
+    user_agent.rtp_port_end = config.connection.rtp_port_end;
+    let ua = Arc::new(TokioMutex::new(user_agent));
+
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
 
@@ -106,6 +110,11 @@ async fn main() -> anyhow::Result<()> {
                 UiCommand::SaveConfig(new_config) => {
                     audio_system.set_output_device(new_config.audio.output_device.clone());
                     audio_system.set_input_device(new_config.audio.input_device.clone());
+                    {
+                        let mut ua_lock = ua.lock().await;
+                        ua_lock.rtp_port_start = new_config.connection.rtp_port_start;
+                        ua_lock.rtp_port_end = new_config.connection.rtp_port_end;
+                    }
                     if let Err(e) = new_config.save_to_file("config.toml") {
                         error!("Failed to save config: {}", e);
                     } else {

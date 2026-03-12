@@ -83,6 +83,8 @@ pub struct UserAgent {
     pub active_calls: Vec<Call>,
     pub reg_state: RegistrationState,
     pub dispatcher: SipDispatcher,
+    pub rtp_port_start: u16,
+    pub rtp_port_end: u16,
 }
 
 fn extract_tag(header: &str) -> Option<String> {
@@ -101,6 +103,8 @@ impl UserAgent {
             active_calls: Vec::new(),
             reg_state: RegistrationState::Unregistered,
             dispatcher: SipDispatcher::new(),
+            rtp_port_start: 10000,
+            rtp_port_end: 10100,
         }
     }
 
@@ -117,6 +121,15 @@ impl UserAgent {
             return "127.0.0.1:5060".to_string();
         }
         socket.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "127.0.0.1:5060".to_string())
+    }
+
+    fn find_free_rtp_port(&self) -> u16 {
+        for port in self.rtp_port_start..=self.rtp_port_end {
+            if StdUdpSocket::bind(format!("0.0.0.0:{}", port)).is_ok() {
+                return port;
+            }
+        }
+        self.rtp_port_start // Fallback
     }
 
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
@@ -208,6 +221,7 @@ impl UserAgent {
     pub async fn invite(&mut self, remote_uri: &str, server_addr: SocketAddr) -> Result<()> {
         let call_id = Uuid::new_v4().to_string();
         let local_tag = Uuid::new_v4().to_string()[..8].to_string();
+        let local_rtp_port = self.find_free_rtp_port();
         self.cseq += 1;
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol().to_string();
@@ -217,7 +231,7 @@ impl UserAgent {
         let mut sdp = SdpSession::new(&self.account.username, "CallSession", &local_addr.split(':').next().unwrap_or("0.0.0.0"));
         sdp.add_media(SdpMediaDescription {
             media_type: "audio".to_string(),
-            port: 4000,
+            port: local_rtp_port,
             transport: "RTP/AVP".to_string(),
             formats: vec!["0".to_string(), "8".to_string()],
             attributes: vec!["rtpmap:0 PCMU/8000".to_string(), "rtpmap:8 PCMA/8000".to_string()],
@@ -248,7 +262,7 @@ impl UserAgent {
             remote_tag: None,
             remote_contact: None,
             remote_rtp_addr: None,
-            local_rtp_port: Some(4000),
+            local_rtp_port: Some(local_rtp_port),
         });
 
         let mut retry_count = 0;

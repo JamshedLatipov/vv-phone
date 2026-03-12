@@ -19,6 +19,8 @@ pub struct SoftphoneApp {
     pub account_password: String,
     pub bind_address: String,
     pub transport_type: TransportType,
+    pub rtp_port_start: u16,
+    pub rtp_port_end: u16,
     pub selected_input_device: String,
     pub selected_output_device: String,
     pub available_input_devices: Vec<String>,
@@ -76,12 +78,24 @@ impl eframe::App for SoftphoneApp {
                 ui.add_space(5.0);
 
                 ui.label("Transport");
-                egui::ComboBox::from_label(" ")
+                egui::ComboBox::from_label("  ")
                     .selected_text(format!("{:?}", self.transport_type))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.transport_type, TransportType::Udp, "UDP");
                         ui.selectable_value(&mut self.transport_type, TransportType::Tcp, "TCP");
                     });
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("RTP Start");
+                        ui.add(egui::DragValue::new(&mut self.rtp_port_start).range(1024..=65535));
+                    });
+                    ui.vertical(|ui| {
+                        ui.label("RTP End");
+                        ui.add(egui::DragValue::new(&mut self.rtp_port_end).range(1024..=65535));
+                    });
+                });
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -137,6 +151,8 @@ impl eframe::App for SoftphoneApp {
                         connection: ConnectionSettings {
                             bind_address: self.bind_address.clone(),
                             transport_type: self.transport_type.clone(),
+                            rtp_port_start: self.rtp_port_start,
+                            rtp_port_end: self.rtp_port_end,
                         },
                         audio: AudioSettings {
                             input_device: Some(self.selected_input_device.clone()),
@@ -217,6 +233,8 @@ impl SoftphoneApp {
             account_password: initial_account.password.unwrap_or_default(),
             bind_address: initial_config.connection.bind_address,
             transport_type: initial_config.connection.transport_type,
+            rtp_port_start: initial_config.connection.rtp_port_start,
+            rtp_port_end: initial_config.connection.rtp_port_end,
             selected_input_device,
             selected_output_device,
             available_input_devices,
