@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tracing::{info, error};
+use tracing::{info, error, debug, warn};
 use std::net::{UdpSocket, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
@@ -69,10 +69,7 @@ impl JitterBuffer {
 
     fn pop(&mut self, count: usize) -> Vec<f32> {
         let actual = count.min(self.samples.len());
-        let mut res = self.samples.drain(0..actual).collect::<Vec<_>>();
-        if res.len() < count {
-            res.resize(count, 0.0);
-        }
+        let res = self.samples.drain(0..actual).collect::<Vec<_>>();
         res
     }
 }
@@ -92,19 +89,45 @@ where T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample {
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let samples_needed = data.len() / channels;
+            // Buffer management: aim for small delay
             let source_needed = (samples_needed as f32 * (source_rate / target_rate)).ceil() as usize + 10;
 
             let source_samples = jb.lock().unwrap().pop(source_needed);
             let mut resampled = vec![0.0f32; samples_needed];
-            resampler.resample(&source_samples, &mut resampled);
+            let (_, produced) = resampler.resample(&source_samples, &mut resampled);
 
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                let s = if i < resampled.len() { resampled[i] * 0.8 } else { 0.0 };
+                let s = if i < produced { resampled[i] * 1.0 } else { 0.0 };
                 let sample = T::from_sample(s);
                 for out in frame.iter_mut() { *out = sample; }
             }
         },
         |err| error!("Output audio stream error: {}", err),
+        None
+    )
+}
+
+fn build_sine_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    freq: f32,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample {
+    let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.0 as f32;
+    let mut sample_clock = 0f32;
+
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            for frame in data.chunks_mut(channels) {
+                sample_clock = (sample_clock + 1.0) % sample_rate;
+                let value = (sample_clock * freq * 2.0 * std::f32::consts::PI / sample_rate).sin() * 0.5;
+                let sample = T::from_sample(value);
+                for out in frame.iter_mut() { *out = sample; }
+            }
+        },
+        |err| error!("Sine audio stream error: {}", err),
         None
     )
 }
@@ -151,47 +174,33 @@ impl AudioSystem {
                         let is_test = matches!(cmd, AudioCommand::PlayTestSound);
                         if let Some(device) = &output_device {
                             if let Ok(config) = device.default_output_config() {
-                                let sample_rate = config.sample_rate().0 as f32;
-                                let channels = config.channels() as usize;
-                                let mut sample_clock = 0f32;
                                 let freq = if is_test { 880.0 } else { 440.0 };
-
                                 let stream_res = match config.sample_format() {
-                                    cpal::SampleFormat::F32 => device.build_output_stream(
-                                        &config.clone().into(),
-                                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                            for frame in data.chunks_mut(channels) {
-                                                sample_clock = (sample_clock + 1.0) % sample_rate;
-                                                let value = (sample_clock * freq * 2.0 * std::f32::consts::PI / sample_rate).sin() * 0.5;
-                                                for sample in frame.iter_mut() { *sample = value; }
-                                            }
-                                        },
-                                        |err| error!("Audio stream error: {}", err),
-                                        None
-                                    ),
-                                    cpal::SampleFormat::I16 => device.build_output_stream(
-                                        &config.clone().into(),
-                                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                                            for frame in data.chunks_mut(channels) {
-                                                sample_clock = (sample_clock + 1.0) % sample_rate;
-                                                let value = (sample_clock * freq * 2.0 * std::f32::consts::PI / sample_rate).sin() * 0.5;
-                                                let s = (value * 32767.0) as i16;
-                                                for sample in frame.iter_mut() { *sample = s; }
-                                            }
-                                        },
-                                        |err| error!("Audio stream error: {}", err),
-                                        None
-                                    ),
-                                    _ => Err(cpal::BuildStreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "Unsupported format".to_string() } }),
+                                    cpal::SampleFormat::F32 => build_sine_stream::<f32>(device, &config.into(), freq),
+                                    cpal::SampleFormat::I16 => build_sine_stream::<i16>(device, &config.into(), freq),
+                                    cpal::SampleFormat::U16 => build_sine_stream::<u16>(device, &config.into(), freq),
+                                    _ => {
+                                        error!("Unsupported sample format: {:?}", config.sample_format());
+                                        continue;
+                                    }
                                 };
 
-                                if let Ok(s) = stream_res {
-                                    if s.play().is_ok() {
-                                        active_stream = Some(s);
-                                        info!("{} started", if is_test { "Test sound" } else { "Ringtone" });
+                                match stream_res {
+                                    Ok(s) => {
+                                        if let Err(e) = s.play() {
+                                            error!("Failed to start audio stream: {}", e);
+                                        } else {
+                                            active_stream = Some(s);
+                                            info!("{} started on device {:?}", if is_test { "Test sound" } else { "Ringtone" }, device.name().ok());
+                                        }
                                     }
+                                    Err(e) => error!("Failed to build audio stream: {}", e),
                                 }
+                            } else {
+                                error!("Failed to get default output config for device {:?}", device.name().ok());
                             }
+                        } else {
+                            error!("No output device selected!");
                         }
                     }
                     AudioCommand::StopRingtone | AudioCommand::StopTestSound => {
@@ -235,12 +244,23 @@ impl AudioSystem {
                         if let Some(device) = &output_device {
                             if let Ok(config) = device.default_output_config() {
                                 let stream_res = match config.sample_format() {
-                                    cpal::SampleFormat::F32 => build_output_stream::<f32>(device, &config.clone().into(), jitter_buffer.clone(), 8000.0),
-                                    cpal::SampleFormat::I16 => build_output_stream::<i16>(device, &config.clone().into(), jitter_buffer.clone(), 8000.0),
-                                    _ => Err(cpal::BuildStreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "Unsupported format".to_string() } }),
+                                    cpal::SampleFormat::F32 => build_output_stream::<f32>(device, &config.into(), jitter_buffer.clone(), 8000.0),
+                                    cpal::SampleFormat::I16 => build_output_stream::<i16>(device, &config.into(), jitter_buffer.clone(), 8000.0),
+                                    cpal::SampleFormat::U16 => build_output_stream::<u16>(device, &config.into(), jitter_buffer.clone(), 8000.0),
+                                    _ => {
+                                        error!("Unsupported sample format for call output: {:?}", config.sample_format());
+                                        continue;
+                                    }
                                 };
-                                if let Ok(s) = stream_res {
-                                    if s.play().is_ok() { call_output_stream = Some(s); }
+                                match stream_res {
+                                    Ok(s) => {
+                                        if let Err(e) = s.play() {
+                                            error!("Failed to start call output stream: {}", e);
+                                        } else {
+                                            call_output_stream = Some(s);
+                                        }
+                                    }
+                                    Err(e) => error!("Failed to build call output stream: {}", e),
                                 }
                             }
                         }
@@ -282,8 +302,15 @@ impl AudioSystem {
                                     |err| error!("Input audio stream error: {}", err),
                                     None
                                 );
-                                if let Ok(s) = stream_res {
-                                    if s.play().is_ok() { call_input_stream = Some(s); }
+                                match stream_res {
+                                    Ok(s) => {
+                                        if let Err(e) = s.play() {
+                                            error!("Failed to start call input stream: {}", e);
+                                        } else {
+                                            call_input_stream = Some(s);
+                                        }
+                                    }
+                                    Err(e) => error!("Failed to build call input stream: {}", e),
                                 }
                             }
                         }
@@ -298,9 +325,6 @@ impl AudioSystem {
                     }
                 }
             }
-            drop(active_stream);
-            drop(call_output_stream);
-            drop(call_input_stream);
         });
 
         Self { tx }
