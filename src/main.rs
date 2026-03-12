@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         softphone::core::Account {
             name: "Default".to_string(),
             username: "user".to_string(),
-            domain: "example.com".to_string(),
+            domain: "127.0.0.1".to_string(),
             password: Some("pass".to_string()),
             proxy: None,
         }
@@ -116,13 +116,6 @@ async fn main() -> anyhow::Result<()> {
                         let target_addr;
                         {
                             let ua_lock = ua.lock().await;
-                            if !uri.starts_with("sip:") {
-                                if uri.contains('@') {
-                                    uri = format!("sip:{}", uri);
-                                } else {
-                                    uri = format!("sip:{}@{}", uri, ua_lock.account.domain);
-                                }
-                            }
 
                             let target = ua_lock.account.proxy.as_ref().unwrap_or(&ua_lock.account.domain);
                             target_addr = if target.contains(':') {
@@ -130,6 +123,15 @@ async fn main() -> anyhow::Result<()> {
                             } else {
                                 format!("{}:5060", target).to_socket_addrs().ok()
                             }.and_then(|mut addrs| addrs.next());
+
+                            if !uri.starts_with("sip:") {
+                                if uri.contains('@') {
+                                    uri = format!("sip:{}", uri);
+                                } else {
+                                    // Use target (proxy/IP) for URI if dial string is just a number
+                                    uri = format!("sip:{}@{}", uri, target);
+                                }
+                            }
                         }
 
                         if let Some(addr) = target_addr {
