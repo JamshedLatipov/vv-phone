@@ -6,7 +6,7 @@ use crate::media::sdp::{SdpSession, SdpMediaDescription};
 use anyhow::{Result, anyhow};
 use tokio::time::{timeout, Duration};
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use uuid::Uuid;
 use tracing::{info, warn, error};
 use tokio::sync::mpsc;
@@ -30,6 +30,45 @@ pub enum RegistrationState {
     Failed(String),
 }
 
+#[derive(Clone)]
+pub struct SipDispatcher {
+    subscriptions: Arc<StdMutex<HashMap<String, mpsc::Sender<SipMessage>>>>,
+}
+
+impl SipDispatcher {
+    pub fn new() -> Self {
+        Self {
+            subscriptions: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn dispatch(&self, msg: SipMessage) {
+        let call_id = match &msg {
+            SipMessage::Request(req) => req.call_id().cloned(),
+            SipMessage::Response(res) => res.call_id().cloned(),
+        };
+
+        if let Some(cid) = call_id {
+            let mut subs = self.subscriptions.lock().unwrap();
+            if let Some(tx) = subs.get(&cid) {
+                let _ = tx.try_send(msg);
+            }
+        }
+    }
+
+    pub fn subscribe(&self, call_id: String) -> mpsc::Receiver<SipMessage> {
+        let (tx, rx) = mpsc::channel(10);
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.insert(call_id, tx);
+        rx
+    }
+
+    pub fn unsubscribe(&self, call_id: &str) {
+        let mut subs = self.subscriptions.lock().unwrap();
+        subs.remove(call_id);
+    }
+}
+
 pub struct UserAgent {
     pub account: Account,
     pub transport: Arc<dyn SipTransport>,
@@ -37,7 +76,7 @@ pub struct UserAgent {
     pub cseq: u32,
     pub active_calls: Vec<Call>,
     pub reg_state: RegistrationState,
-    subscriptions: HashMap<String, mpsc::Sender<SipMessage>>,
+    pub dispatcher: SipDispatcher,
 }
 
 fn extract_tag(header: &str) -> Option<String> {
@@ -55,31 +94,8 @@ impl UserAgent {
             cseq: 1,
             active_calls: Vec::new(),
             reg_state: RegistrationState::Unregistered,
-            subscriptions: HashMap::new(),
+            dispatcher: SipDispatcher::new(),
         }
-    }
-
-    pub fn dispatch(&mut self, msg: SipMessage) {
-        let call_id = match &msg {
-            SipMessage::Request(req) => req.call_id().cloned(),
-            SipMessage::Response(res) => res.call_id().cloned(),
-        };
-
-        if let Some(cid) = call_id {
-            if let Some(tx) = self.subscriptions.get(&cid) {
-                let _ = tx.try_send(msg);
-            }
-        }
-    }
-
-    pub fn subscribe(&mut self, call_id: String) -> mpsc::Receiver<SipMessage> {
-        let (tx, rx) = mpsc::channel(10);
-        self.subscriptions.insert(call_id, tx);
-        rx
-    }
-
-    pub fn unsubscribe(&mut self, call_id: &str) {
-        self.subscriptions.remove(call_id);
     }
 
     fn get_public_local_addr(&self, target: SocketAddr) -> String {
@@ -104,8 +120,8 @@ impl UserAgent {
         let uri = format!("sip:{}", self.account.domain);
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol().to_string();
-        let mut rx = self.subscribe(self.call_id.clone());
         let cid = self.call_id.clone();
+        let mut rx = self.dispatcher.subscribe(cid.clone());
 
         self.cseq += 1;
         let req = SipRequest::new(Method::Register, &uri)
@@ -125,7 +141,7 @@ impl UserAgent {
             Ok(Some(SipMessage::Response(res))) => res,
             _ => {
                 self.reg_state = RegistrationState::Failed("Timeout waiting for response".to_string());
-                self.unsubscribe(&cid);
+                self.dispatcher.unsubscribe(&cid);
                 return Err(anyhow!("Timeout waiting for response"));
             }
         };
@@ -171,7 +187,7 @@ impl UserAgent {
                     Ok(Some(SipMessage::Response(res))) => res,
                     _ => {
                         self.reg_state = RegistrationState::Failed("Timeout waiting for auth response".to_string());
-                        self.unsubscribe(&cid);
+                        self.dispatcher.unsubscribe(&cid);
                         return Err(anyhow!("Timeout waiting for auth response"));
                     }
                 };
@@ -190,7 +206,7 @@ impl UserAgent {
             }
         }
 
-        self.unsubscribe(&cid);
+        self.dispatcher.unsubscribe(&cid);
         Ok(())
     }
 
@@ -200,8 +216,8 @@ impl UserAgent {
         self.cseq += 1;
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol().to_string();
-        let mut rx = self.subscribe(call_id.clone());
         let cid = call_id.clone();
+        let mut rx = self.dispatcher.subscribe(cid.clone());
 
         let mut sdp = SdpSession::new(&self.account.username, "CallSession", &local_addr.split(':').next().unwrap_or("0.0.0.0"));
         sdp.add_media(SdpMediaDescription {
@@ -331,7 +347,7 @@ impl UserAgent {
             }
         }
 
-        self.unsubscribe(&cid);
+        self.dispatcher.unsubscribe(&cid);
         Ok(())
     }
 

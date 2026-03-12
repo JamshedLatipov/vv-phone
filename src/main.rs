@@ -58,16 +58,18 @@ async fn main() -> anyhow::Result<()> {
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
 
-    // Receiver task to dispatch packets to UserAgent
+    // Receiver task to dispatch packets to UserAgent without holding UA lock
     let transport_dispatch = transport.clone();
-    let ua_dispatch = ua.clone();
+    let dispatcher = {
+        let ua_lock = ua.lock().await;
+        ua_lock.dispatcher.clone()
+    };
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
         while let Ok((n, _addr)) = transport_dispatch.recv_from(&mut buf).await {
             let data = String::from_utf8_lossy(&buf[..n]);
             if let Some(msg) = SipMessage::parse(&data) {
-                let mut ua_lock = ua_dispatch.lock().await;
-                ua_lock.dispatch(msg);
+                dispatcher.dispatch(msg);
             }
         }
     });
@@ -128,7 +130,6 @@ async fn main() -> anyhow::Result<()> {
                                 if uri.contains('@') {
                                     uri = format!("sip:{}", uri);
                                 } else {
-                                    // Use target (proxy/IP) for URI if dial string is just a number
                                     uri = format!("sip:{}@{}", uri, target);
                                 }
                             }
