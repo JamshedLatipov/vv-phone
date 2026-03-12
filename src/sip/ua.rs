@@ -1,5 +1,5 @@
 use crate::core::{Account, CallState};
-use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage};
+use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage, SipResponse};
 use crate::sip::transport::SipTransport;
 use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop};
 use crate::media::sdp::{SdpSession, SdpMediaDescription};
@@ -15,6 +15,9 @@ pub struct Call {
     pub id: String,
     pub state: CallState,
     pub remote_uri: String,
+    pub local_tag: String,
+    pub remote_tag: Option<String>,
+    pub remote_contact: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +35,12 @@ pub struct UserAgent {
     pub cseq: u32,
     pub active_calls: Vec<Call>,
     pub reg_state: RegistrationState,
+}
+
+fn extract_tag(header: &str) -> Option<String> {
+    header.split(';').find(|p| p.trim().starts_with("tag="))
+        .and_then(|p| p.split_once('='))
+        .map(|(_, v)| v.trim().to_string())
 }
 
 impl UserAgent {
@@ -155,6 +164,7 @@ impl UserAgent {
 
     pub async fn invite(&mut self, remote_uri: &str, server_addr: SocketAddr) -> Result<()> {
         let call_id = Uuid::new_v4().to_string();
+        let local_tag = Uuid::new_v4().to_string()[..8].to_string();
         self.cseq += 1;
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol();
@@ -171,7 +181,7 @@ impl UserAgent {
 
         let mut req = SipRequest::new(Method::Invite, remote_uri)
             .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-invite-{}", proto, local_addr, Uuid::new_v4()))
-            .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
+            .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, local_tag))
             .with_header("To", &format!("<{}>", remote_uri))
             .with_header("Call-ID", &call_id)
             .with_header("CSeq", &format!("{} INVITE", self.cseq))
@@ -189,6 +199,9 @@ impl UserAgent {
             id: call_id.clone(),
             state: CallState::Calling,
             remote_uri: remote_uri.to_string(),
+            local_tag,
+            remote_tag: None,
+            remote_contact: None,
         });
 
         // Wait for response and handle auth challenges
@@ -204,6 +217,19 @@ impl UserAgent {
             let resp_str = String::from_utf8_lossy(&buf[..len]);
             if let Some(SipMessage::Response(res)) = SipMessage::parse(&resp_str) {
                 info!("Received {} {} for INVITE", res.status_code, res.reason);
+
+                let r_tag = res.get_header("To").and_then(|h| extract_tag(h));
+                let r_contact = res.get_header("Contact").map(|h| h.trim_matches(|c| c == '<' || c == '>').to_string());
+
+                if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+                    if r_tag.is_some() {
+                        self.active_calls[pos].remote_tag = r_tag.clone();
+                    }
+                    if r_contact.is_some() {
+                        self.active_calls[pos].remote_contact = r_contact.clone();
+                    }
+                }
+
                 if res.status_code == 100 || res.status_code == 180 || res.status_code == 183 {
                     if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
                         if res.status_code == 180 || res.status_code == 183 {
@@ -214,9 +240,22 @@ impl UserAgent {
                 }
                 if res.status_code == 200 {
                     if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+                        let call = self.active_calls[pos].clone();
                         self.active_calls[pos].state = CallState::Connected;
+
+                        // Send ACK
+                        let ack_uri = call.remote_contact.as_ref().unwrap_or(&call.remote_uri);
+                        let ack = SipRequest::new(Method::Ack, ack_uri)
+                            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-ack-{}", proto, local_addr, Uuid::new_v4()))
+                            .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, call.local_tag))
+                            .with_header("To", &format!("<{}>;tag={}", call.remote_uri, call.remote_tag.as_deref().unwrap_or("")))
+                            .with_header("Call-ID", &call.id)
+                            .with_header("CSeq", &format!("{} ACK", self.cseq))
+                            .with_header("Max-Forwards", "70");
+
+                        info!("Sending ACK to {}", server_addr);
+                        self.transport.send_to(ack.to_string().as_bytes(), server_addr).await?;
                     }
-                    // ACK should be sent here
                     break;
                 }
                 if res.status_code == 401 || res.status_code == 407 {
@@ -249,7 +288,7 @@ impl UserAgent {
 
                         info!("Retrying INVITE with auth to {}", server_addr);
                         self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
-                        continue; // Wait for next response
+                        continue;
                     }
                 }
                 if res.status_code >= 400 {
@@ -267,15 +306,16 @@ impl UserAgent {
 
     pub async fn hangup(&mut self, call_id: String, server_addr: SocketAddr) -> Result<()> {
         if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
-            let call = &self.active_calls[pos];
+            let call = self.active_calls[pos].clone();
             self.cseq += 1;
             let local_addr = self.get_public_local_addr(server_addr);
             let proto = self.transport.protocol();
 
-            let req = SipRequest::new(Method::Bye, &call.remote_uri)
+            let bye_uri = call.remote_contact.as_ref().unwrap_or(&call.remote_uri);
+            let req = SipRequest::new(Method::Bye, bye_uri)
                 .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-bye-{}", proto, local_addr, Uuid::new_v4()))
-                .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
-                .with_header("To", &format!("<{}>", call.remote_uri))
+                .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, call.local_tag))
+                .with_header("To", &format!("<{}>;tag={}", call.remote_uri, call.remote_tag.as_deref().unwrap_or("")))
                 .with_header("Call-ID", &call.id)
                 .with_header("CSeq", &format!("{} BYE", self.cseq))
                 .with_header("User-Agent", "Softphone/0.1.0")
