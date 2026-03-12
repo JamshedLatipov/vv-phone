@@ -1,6 +1,7 @@
 use softphone::config::{Config, TransportType};
 use softphone::sip::transport::{SipUdpTransport, SipTcpTransport, SipTransport};
 use softphone::sip::ua::{UserAgent, RegistrationState, Call};
+use softphone::sip::SipMessage;
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
 use clap::Parser;
@@ -57,7 +58,21 @@ async fn main() -> anyhow::Result<()> {
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
 
-    // Background task for SIP UserAgent logic and command handling
+    // Receiver task to dispatch packets to UserAgent
+    let transport_dispatch = transport.clone();
+    let ua_dispatch = ua.clone();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        while let Ok((n, _addr)) = transport_dispatch.recv_from(&mut buf).await {
+            let data = String::from_utf8_lossy(&buf[..n]);
+            if let Some(msg) = SipMessage::parse(&data) {
+                let mut ua_lock = ua_dispatch.lock().await;
+                ua_lock.dispatch(msg);
+            }
+        }
+    });
+
+    // Background task for command handling
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let ua = ua.clone();

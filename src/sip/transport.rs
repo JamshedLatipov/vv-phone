@@ -17,13 +17,27 @@ pub trait SipTransport: Send + Sync {
 }
 
 pub struct SipUdpTransport {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
+    recv_rx: Arc<Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>>,
 }
 
 impl SipUdpTransport {
     pub async fn new(bind_addr: &str) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await?;
-        Ok(Self { socket })
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let (tx, rx) = mpsc::channel(100);
+
+        let socket_clone = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            while let Ok((n, addr)) = socket_clone.recv_from(&mut buf).await {
+                if tx.send((buf[..n].to_vec(), addr)).await.is_err() { break; }
+            }
+        });
+
+        Ok(Self {
+            socket,
+            recv_rx: Arc::new(Mutex::new(rx)),
+        })
     }
 }
 
@@ -34,7 +48,14 @@ impl SipTransport for SipUdpTransport {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        Ok(self.socket.recv_from(buf).await?)
+        let mut rx = self.recv_rx.lock().await;
+        if let Some((data, addr)) = rx.recv().await {
+            let len = data.len().min(buf.len());
+            buf[..len].copy_from_slice(&data[..len]);
+            Ok((len, addr))
+        } else {
+            Err(anyhow::anyhow!("UDP receive channel closed"))
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
