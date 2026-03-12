@@ -129,7 +129,7 @@ impl UserAgent {
                 return port;
             }
         }
-        self.rtp_port_start // Fallback
+        self.rtp_port_start
     }
 
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
@@ -235,6 +235,7 @@ impl UserAgent {
             transport: "RTP/AVP".to_string(),
             formats: vec!["0".to_string(), "8".to_string()],
             attributes: vec!["rtpmap:0 PCMU/8000".to_string(), "rtpmap:8 PCMA/8000".to_string()],
+            connection_info: None,
         });
         let sdp_str = sdp.to_string();
 
@@ -298,16 +299,13 @@ impl UserAgent {
                     if let Some(pos) = self.active_calls.iter().position(|c| c.id == cid) {
                         self.active_calls[pos].state = CallState::Connected;
 
-                        // Parse SDP for remote RTP address
                         let body_str = String::from_utf8_lossy(&res.body);
                         if let Some(remote_sdp) = SdpSession::parse(&body_str) {
                             if let Some(media) = remote_sdp.media_descriptions.iter().find(|m| m.media_type == "audio") {
-                                let c_info = if !remote_sdp.connection_info.is_empty() {
-                                    &remote_sdp.connection_info
-                                } else {
-                                    ""
-                                };
-                                let ip = c_info.split_whitespace().last().unwrap_or("0.0.0.0");
+                                let ip = media.connection_info.as_ref()
+                                    .or(if remote_sdp.connection_info.is_empty() { None } else { Some(&remote_sdp.connection_info) })
+                                    .and_then(|c| c.split_whitespace().last())
+                                    .unwrap_or("0.0.0.0");
                                 if let Ok(addr) = format!("{}:{}", ip, media.port).parse::<SocketAddr>() {
                                     self.active_calls[pos].remote_rtp_addr = Some(addr);
                                     info!("Negotiated RTP address: {}", addr);
@@ -413,7 +411,10 @@ mod ua_tests {
         let sdp_body = "v=0\r\no=alice 12345 67890 IN IP4 1.2.3.4\r\ns=Session\r\nc=IN IP4 1.2.3.4\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
         let sdp = SdpSession::parse(sdp_body).unwrap();
         let media = sdp.media_descriptions.iter().find(|m| m.media_type == "audio").unwrap();
-        let ip = sdp.connection_info.split_whitespace().last().unwrap();
+        let ip = media.connection_info.as_ref()
+            .or(if sdp.connection_info.is_empty() { None } else { Some(&sdp.connection_info) })
+            .and_then(|c| c.split_whitespace().last())
+            .unwrap_or("0.0.0.0");
         let addr: SocketAddr = format!("{}:{}", ip, media.port).parse().unwrap();
         assert_eq!(addr.to_string(), "1.2.3.4:5000");
     }

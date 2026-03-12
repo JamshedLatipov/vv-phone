@@ -171,19 +171,19 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(addr) = target_addr {
                             let mut ua_lock = ua.lock().await;
 
-                            // Play ringing sound
+                            // Play ringback tone
                             audio_invite.play_ringtone();
 
                             if let Err(e) = ua_lock.invite(&uri, addr).await {
                                 error!("Invite error: {}", e);
-                                audio_invite.stop_ringtone();
-                            } else {
-                                audio_invite.stop_ringtone();
-                                // Check if call is connected
-                                if let Some(call) = ua_lock.active_calls.iter().find(|c| c.state == CallState::Connected) {
-                                    if let Some(remote_rtp) = call.remote_rtp_addr {
-                                        audio_invite.start_call_audio(remote_rtp, call.local_rtp_port.unwrap_or(4000));
-                                    }
+                            }
+
+                            audio_invite.stop_ringtone();
+
+                            // Check if call is connected and start RTP
+                            if let Some(call) = ua_lock.active_calls.iter().find(|c| c.state == CallState::Connected) {
+                                if let Some(remote_rtp) = call.remote_rtp_addr {
+                                    audio_invite.start_call_audio(remote_rtp, call.local_rtp_port.unwrap_or(10000));
                                 }
                             }
 

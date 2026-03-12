@@ -33,3 +33,44 @@ impl G711 {
         if sign { sample } else { -sample }
     }
 }
+
+pub struct Resampler {
+    source_rate: f32,
+    target_rate: f32,
+    phase: f32,
+}
+
+impl Resampler {
+    pub fn new(source_rate: f32, target_rate: f32) -> Self {
+        Self {
+            source_rate,
+            target_rate,
+            phase: 0.0,
+        }
+    }
+
+    pub fn resample(&mut self, input: &[f32], output: &mut [f32]) -> (usize, usize) {
+        let ratio = self.source_rate / self.target_rate;
+        let mut in_idx = 0;
+        let mut out_idx = 0;
+
+        while out_idx < output.len() && (in_idx as f32 + self.phase) < input.len() as f32 {
+            let current_in = in_idx as f32 + self.phase;
+            let i = current_in.floor() as usize;
+            let frac = current_in - current_in.floor();
+
+            let next_i = if i + 1 < input.len() { i + 1 } else { i };
+
+            // Linear interpolation
+            output[out_idx] = input[i] * (1.0 - frac) + input[next_i] * frac;
+
+            out_idx += 1;
+            self.phase += ratio;
+            while self.phase >= 1.0 {
+                self.phase -= 1.0;
+                in_idx += 1;
+            }
+        }
+        (in_idx, out_idx)
+    }
+}
