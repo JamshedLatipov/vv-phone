@@ -88,7 +88,15 @@ async fn main() -> anyhow::Result<()> {
                         *state = RegistrationState::Failed(format!("DNS resolution failed for {}", target));
                     }
                 }
-                UiCommand::Invite(uri) => {
+                UiCommand::Invite(mut uri) => {
+                    if !uri.starts_with("sip:") {
+                        if uri.contains('@') {
+                            uri = format!("sip:{}", uri);
+                        } else {
+                            uri = format!("sip:{}@{}", uri, ua.account.domain);
+                        }
+                    }
+
                     let target = ua.account.proxy.as_ref().unwrap_or(&ua.account.domain);
                     let server_addr = if target.contains(':') {
                         target.to_socket_addrs().ok()

@@ -2,6 +2,7 @@ use crate::core::{Account, CallState};
 use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage};
 use crate::sip::transport::SipTransport;
 use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop};
+use crate::media::sdp::{SdpSession, SdpMediaDescription};
 use anyhow::{Result, anyhow};
 use tokio::time::{timeout, Duration};
 use std::net::SocketAddr;
@@ -51,17 +52,17 @@ impl UserAgent {
 
         let uri = format!("sip:{}", self.account.domain);
         let local_addr = self.transport.local_addr()?.to_string();
+        let proto = self.transport.protocol();
 
         let req = SipRequest::new(Method::Register, &uri)
-            .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-register-{}", local_addr, Uuid::new_v4()))
+            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-register-{}", proto, local_addr, Uuid::new_v4()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", &format!("<sip:{}@{}>", self.account.username, self.account.domain))
             .with_header("Call-ID", &self.call_id)
             .with_header("CSeq", &format!("{} REGISTER", self.cseq))
             .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Max-Forwards", "70")
-            .with_header("Expires", "3600")
-            .with_header("Content-Length", "0");
+            .with_header("Expires", "3600");
 
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
@@ -90,6 +91,7 @@ impl UserAgent {
                     let qop = authenticate.split("qop=\"").nth(1).and_then(|s| s.split('\"').next());
 
                     let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
+                    let method_str = Method::Register.to_string();
 
                     let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
                         self.account.username, realm, nonce, uri);
@@ -97,10 +99,10 @@ impl UserAgent {
                     if let Some(_q) = qop.filter(|&q| q.contains("auth")) {
                         let cnonce = Uuid::new_v4().to_string()[..8].to_string();
                         let nc = "00000001";
-                        let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", "REGISTER", &uri);
+                        let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", &method_str, &uri);
                         auth_val.push_str(&format!(", qop=\"auth\", nc={}, cnonce=\"{}\", response=\"{}\"", nc, cnonce, response));
                     } else {
-                        let response = calculate_digest_response(&self.account.username, password, realm, nonce, "REGISTER", &uri);
+                        let response = calculate_digest_response(&self.account.username, password, realm, nonce, &method_str, &uri);
                         auth_val.push_str(&format!(", response=\"{}\"", response));
                     }
 
@@ -143,16 +145,30 @@ impl UserAgent {
         let call_id = Uuid::new_v4().to_string();
         self.cseq += 1;
         let local_addr = self.transport.local_addr()?.to_string();
+        let proto = self.transport.protocol();
+
+        let mut sdp = SdpSession::new(&self.account.username, "CallSession", &local_addr.split(':').next().unwrap_or("0.0.0.0"));
+        sdp.add_media(SdpMediaDescription {
+            media_type: "audio".to_string(),
+            port: 4000,
+            transport: "RTP/AVP".to_string(),
+            formats: vec!["0".to_string(), "8".to_string()],
+            attributes: vec!["rtpmap:0 PCMU/8000".to_string(), "rtpmap:8 PCMA/8000".to_string()],
+        });
+        let sdp_str = sdp.to_string();
 
         let req = SipRequest::new(Method::Invite, remote_uri)
-            .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-invite-{}", local_addr, Uuid::new_v4()))
+            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-invite-{}", proto, local_addr, Uuid::new_v4()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
-            .with_header("To", remote_uri)
+            .with_header("To", &format!("<{}>", remote_uri))
             .with_header("Call-ID", &call_id)
             .with_header("CSeq", &format!("{} INVITE", self.cseq))
             .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Content-Type", "application/sdp")
             .with_header("Max-Forwards", "70");
+
+        let mut req = req;
+        req.body = sdp_str.into_bytes();
 
         self.active_calls.push(Call {
             id: call_id,
@@ -169,15 +185,15 @@ impl UserAgent {
             let call = &self.active_calls[pos];
             self.cseq += 1;
             let local_addr = self.transport.local_addr()?.to_string();
+            let proto = self.transport.protocol();
 
             let req = SipRequest::new(Method::Bye, &call.remote_uri)
-                .with_header("Via", &format!("SIP/2.0/UDP {};branch=z9hG4bK-bye-{}", local_addr, Uuid::new_v4()))
+                .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-bye-{}", proto, local_addr, Uuid::new_v4()))
                 .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
-                .with_header("To", &call.remote_uri)
+                .with_header("To", &format!("<{}>", call.remote_uri))
                 .with_header("Call-ID", &call.id)
                 .with_header("CSeq", &format!("{} BYE", self.cseq))
-                .with_header("Max-Forwards", "70")
-                .with_header("Content-Length", "0");
+                .with_header("Max-Forwards", "70");
 
             self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
             self.active_calls.remove(pos);

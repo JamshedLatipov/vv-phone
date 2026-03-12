@@ -13,6 +13,7 @@ pub trait SipTransport: Send + Sync {
     async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize>;
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
     fn local_addr(&self) -> Result<SocketAddr>;
+    fn protocol(&self) -> &str;
 }
 
 pub struct SipUdpTransport {
@@ -38,6 +39,10 @@ impl SipTransport for SipUdpTransport {
 
     fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
+    }
+
+    fn protocol(&self) -> &str {
+        "UDP"
     }
 }
 
@@ -129,5 +134,9 @@ impl SipTransport for SipTcpTransport {
 
     fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+
+    fn protocol(&self) -> &str {
+        "TCP"
     }
 }

@@ -85,12 +85,22 @@ impl eframe::App for SoftphoneApp {
                     .min_size(egui::vec2(ui.available_width(), 30.0)))
                     .clicked()
                 {
+                    // Logic to separate domain and proxy if needed.
+                    // For now, if domain contains ':', we treat it as proxy.
+                    let (domain, proxy) = if self.account_domain.contains(':') || self.account_domain.chars().any(|c| c.is_numeric()) {
+                        // Very basic heuristic: if it looks like an IP or has a port, it's likely a proxy/server address.
+                        // We still need a domain for the From/To headers.
+                        ("example.com".to_string(), Some(self.account_domain.clone()))
+                    } else {
+                        (self.account_domain.clone(), None)
+                    };
+
                     let account = Account {
                         name: self.account_name.clone(),
                         username: self.account_username.clone(),
-                        domain: self.account_domain.clone(),
+                        domain: domain,
                         password: Some(self.account_password.clone()),
-                        proxy: None,
+                        proxy: proxy,
                     };
 
                     let config = Config {
@@ -152,7 +162,7 @@ impl SoftphoneApp {
         Self {
             account_name: initial_account.name,
             account_username: initial_account.username,
-            account_domain: initial_account.domain,
+            account_domain: initial_account.proxy.unwrap_or(initial_account.domain),
             account_password: initial_account.password.unwrap_or_default(),
             bind_address: initial_config.connection.bind_address,
             transport_type: initial_config.connection.transport_type,
