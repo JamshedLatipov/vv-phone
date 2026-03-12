@@ -27,7 +27,6 @@ pub struct SoftphoneApp {
 
 impl eframe::App for SoftphoneApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply modern dark theme
         ctx.set_visuals(egui::Visuals::dark());
 
         egui::SidePanel::left("settings_panel")
@@ -85,12 +84,22 @@ impl eframe::App for SoftphoneApp {
                     .min_size(egui::vec2(ui.available_width(), 30.0)))
                     .clicked()
                 {
+                    // Logic to separate domain and proxy.
+                    // Support format: "domain / proxy" or just "domain" (which will also be proxy if it looks like IP)
+                    let (domain, proxy) = if let Some((d, p)) = self.account_domain.split_once('/') {
+                        (d.trim().to_string(), Some(p.trim().to_string()))
+                    } else if self.account_domain.contains(':') || self.account_domain.chars().any(|c| c.is_numeric()) {
+                        (self.account_domain.clone(), Some(self.account_domain.clone()))
+                    } else {
+                        (self.account_domain.clone(), None)
+                    };
+
                     let account = Account {
                         name: self.account_name.clone(),
                         username: self.account_username.clone(),
-                        domain: self.account_domain.clone(),
+                        domain,
                         password: Some(self.account_password.clone()),
-                        proxy: None,
+                        proxy,
                     };
 
                     let config = Config {
@@ -143,16 +152,26 @@ impl SoftphoneApp {
             Account {
                 name: "Default".to_string(),
                 username: "user".to_string(),
-                domain: "example.com".to_string(),
+                domain: "127.0.0.1".to_string(),
                 password: Some("pass".to_string()),
                 proxy: None,
             }
         });
 
+        let display_domain = if let Some(p) = &initial_account.proxy {
+            if p != &initial_account.domain {
+                format!("{} / {}", initial_account.domain, p)
+            } else {
+                initial_account.domain.clone()
+            }
+        } else {
+            initial_account.domain.clone()
+        };
+
         Self {
             account_name: initial_account.name,
             account_username: initial_account.username,
-            account_domain: initial_account.domain,
+            account_domain: display_domain,
             account_password: initial_account.password.unwrap_or_default(),
             bind_address: initial_config.connection.bind_address,
             transport_type: initial_config.connection.transport_type,

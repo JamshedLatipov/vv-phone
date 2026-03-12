@@ -7,22 +7,46 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use std::collections::HashMap;
 use tokio::net::tcp::{OwnedWriteHalf};
+use tracing::{warn, error};
 
 #[async_trait]
 pub trait SipTransport: Send + Sync {
     async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<usize>;
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)>;
     fn local_addr(&self) -> Result<SocketAddr>;
+    fn protocol(&self) -> &str;
 }
 
 pub struct SipUdpTransport {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
+    recv_rx: Arc<Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>>,
 }
 
 impl SipUdpTransport {
     pub async fn new(bind_addr: &str) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr).await?;
-        Ok(Self { socket })
+        let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+        let (tx, rx) = mpsc::channel(100);
+
+        let socket_clone = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match socket_clone.recv_from(&mut buf).await {
+                    Ok((n, addr)) => {
+                        if tx.send((buf[..n].to_vec(), addr)).await.is_err() { break; }
+                    }
+                    Err(e) => {
+                        warn!("UDP recv_from error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            socket,
+            recv_rx: Arc::new(Mutex::new(rx)),
+        })
     }
 }
 
@@ -33,11 +57,22 @@ impl SipTransport for SipUdpTransport {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
-        Ok(self.socket.recv_from(buf).await?)
+        let mut rx = self.recv_rx.lock().await;
+        if let Some((data, addr)) = rx.recv().await {
+            let len = data.len().min(buf.len());
+            buf[..len].copy_from_slice(&data[..len]);
+            Ok((len, addr))
+        } else {
+            Err(anyhow::anyhow!("UDP receive channel closed"))
+        }
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
+    }
+
+    fn protocol(&self) -> &str {
+        "UDP"
     }
 }
 
@@ -129,5 +164,9 @@ impl SipTransport for SipTcpTransport {
 
     fn local_addr(&self) -> Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+
+    fn protocol(&self) -> &str {
+        "TCP"
     }
 }

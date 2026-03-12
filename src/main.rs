@@ -1,12 +1,14 @@
 use softphone::config::{Config, TransportType};
 use softphone::sip::transport::{SipUdpTransport, SipTcpTransport, SipTransport};
 use softphone::sip::ua::{UserAgent, RegistrationState, Call};
+use softphone::sip::SipMessage;
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
 use clap::Parser;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex as TokioMutex;
 use std::net::ToSocketAddrs;
-use tracing::{info, Level, error};
+use tracing::{info, Level, error, debug};
 use tracing_subscriber::FmtSubscriber;
 use tokio::sync::mpsc;
 
@@ -42,23 +44,54 @@ async fn main() -> anyhow::Result<()> {
         softphone::core::Account {
             name: "Default".to_string(),
             username: "user".to_string(),
-            domain: "example.com".to_string(),
+            domain: "127.0.0.1".to_string(),
             password: Some("pass".to_string()),
             proxy: None,
         }
     });
 
-    let reg_state = Arc::new(Mutex::new(RegistrationState::Unregistered));
-    let active_calls = Arc::new(Mutex::new(Vec::<Call>::new()));
+    let reg_state = Arc::new(StdMutex::new(RegistrationState::Unregistered));
+    let active_calls = Arc::new(StdMutex::new(Vec::<Call>::new()));
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    let mut ua = UserAgent::new(initial_account.clone(), transport.clone());
+    let ua = Arc::new(TokioMutex::new(UserAgent::new(initial_account.clone(), transport.clone())));
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
 
-    // Background task for SIP UserAgent logic and command handling
+    // Receiver task to dispatch packets to UserAgent without holding UA lock
+    let transport_dispatch = transport.clone();
+    let dispatcher = {
+        let ua_lock = ua.lock().await;
+        ua_lock.dispatcher.clone()
+    };
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match transport_dispatch.recv_from(&mut buf).await {
+                Ok((n, addr)) => {
+                    let data = String::from_utf8_lossy(&buf[..n]);
+                    debug!("Received {} bytes from {}: {}", n, addr, data);
+                    if let Some(msg) = SipMessage::parse(&data) {
+                        dispatcher.dispatch(msg);
+                    } else {
+                        debug!("Failed to parse SIP message from {}", addr);
+                    }
+                }
+                Err(e) => {
+                    error!("Transport receive error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+    });
+
+    // Background task for command handling
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
+            let ua = ua.clone();
+            let reg_state = reg_state.clone();
+            let active_calls = active_calls.clone();
+
             match cmd {
                 UiCommand::SaveConfig(new_config) => {
                     if let Err(e) = new_config.save_to_file("config.toml") {
@@ -68,57 +101,83 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 UiCommand::Register(account) => {
-                    ua.account = account.clone();
-                    let target = account.proxy.as_ref().unwrap_or(&account.domain);
-                    let server_addr = if target.contains(':') {
-                        target.to_socket_addrs().ok()
-                    } else {
-                        format!("{}:5060", target).to_socket_addrs().ok()
-                    }.and_then(|mut addrs| addrs.next());
+                    tokio::spawn(async move {
+                        let mut ua_lock = ua.lock().await;
+                        ua_lock.account = account.clone();
+                        let target = account.proxy.as_ref().unwrap_or(&account.domain);
+                        let server_addr = if target.contains(':') {
+                            target.to_socket_addrs().ok()
+                        } else {
+                            format!("{}:5060", target).to_socket_addrs().ok()
+                        }.and_then(|mut addrs| addrs.next());
 
-                    if let Some(addr) = server_addr {
-                        if let Err(e) = ua.register(addr).await {
-                            error!("Registration error: {}", e);
+                        if let Some(addr) = server_addr {
+                            if let Err(e) = ua_lock.register(addr).await {
+                                error!("Registration error: {}", e);
+                            }
+                            let mut state = reg_state.lock().unwrap();
+                            *state = ua_lock.reg_state.clone();
+                        } else {
+                            error!("Could not resolve server address for {}", target);
+                            let mut state = reg_state.lock().unwrap();
+                            *state = RegistrationState::Failed(format!("DNS resolution failed for {}", target));
                         }
-                        let mut state = reg_state_clone.lock().unwrap();
-                        *state = ua.reg_state.clone();
-                    } else {
-                        error!("Could not resolve server address for {}", target);
-                        let mut state = reg_state_clone.lock().unwrap();
-                        *state = RegistrationState::Failed(format!("DNS resolution failed for {}", target));
-                    }
+                    });
                 }
-                UiCommand::Invite(uri) => {
-                    let target = ua.account.proxy.as_ref().unwrap_or(&ua.account.domain);
-                    let server_addr = if target.contains(':') {
-                        target.to_socket_addrs().ok()
-                    } else {
-                        format!("{}:5060", target).to_socket_addrs().ok()
-                    }.and_then(|mut addrs| addrs.next());
+                UiCommand::Invite(mut uri) => {
+                    tokio::spawn(async move {
+                        let target_addr;
+                        {
+                            let ua_lock = ua.lock().await;
 
-                    if let Some(addr) = server_addr {
-                        if let Err(e) = ua.invite(&uri, addr).await {
-                            error!("Invite error: {}", e);
+                            let target = ua_lock.account.proxy.as_ref().unwrap_or(&ua_lock.account.domain);
+                            target_addr = if target.contains(':') {
+                                target.to_socket_addrs().ok()
+                            } else {
+                                format!("{}:5060", target).to_socket_addrs().ok()
+                            }.and_then(|mut addrs| addrs.next());
+
+                            if !uri.starts_with("sip:") {
+                                if uri.contains('@') {
+                                    uri = format!("sip:{}", uri);
+                                } else {
+                                    uri = format!("sip:{}@{}", uri, target);
+                                }
+                            }
                         }
-                        let mut calls = active_calls_clone.lock().unwrap();
-                        *calls = ua.active_calls.clone();
-                    }
+
+                        if let Some(addr) = target_addr {
+                            let mut ua_lock = ua.lock().await;
+                            if let Err(e) = ua_lock.invite(&uri, addr).await {
+                                error!("Invite error: {}", e);
+                            }
+                            let mut calls = active_calls.lock().unwrap();
+                            *calls = ua_lock.active_calls.clone();
+                        }
+                    });
                 }
                 UiCommand::Hangup(id) => {
-                    let target = ua.account.proxy.as_ref().unwrap_or(&ua.account.domain);
-                    let server_addr = if target.contains(':') {
-                        target.to_socket_addrs().ok()
-                    } else {
-                        format!("{}:5060", target).to_socket_addrs().ok()
-                    }.and_then(|mut addrs| addrs.next());
-
-                    if let Some(addr) = server_addr {
-                        if let Err(e) = ua.hangup(id, addr).await {
-                            error!("Hangup error: {}", e);
+                    tokio::spawn(async move {
+                        let target_addr;
+                        {
+                            let ua_lock = ua.lock().await;
+                            let target = ua_lock.account.proxy.as_ref().unwrap_or(&ua_lock.account.domain);
+                            target_addr = if target.contains(':') {
+                                target.to_socket_addrs().ok()
+                            } else {
+                                format!("{}:5060", target).to_socket_addrs().ok()
+                            }.and_then(|mut addrs| addrs.next());
                         }
-                        let mut calls = active_calls_clone.lock().unwrap();
-                        *calls = ua.active_calls.clone();
-                    }
+
+                        if let Some(addr) = target_addr {
+                            let mut ua_lock = ua.lock().await;
+                            if let Err(e) = ua_lock.hangup(id, addr).await {
+                                error!("Hangup error: {}", e);
+                            }
+                            let mut calls = active_calls.lock().unwrap();
+                            *calls = ua_lock.active_calls.clone();
+                        }
+                    });
                 }
             }
         }
@@ -127,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.ui {
         info!("Launching UI...");
         let native_options = eframe::NativeOptions::default();
-        let app = SoftphoneApp::new(config, cmd_tx, reg_state, active_calls);
+        let app = SoftphoneApp::new(config, cmd_tx, reg_state_clone, active_calls_clone);
         eframe::run_native(
             "Softphone",
             native_options,

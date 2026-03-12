@@ -93,14 +93,46 @@ pub trait SipHeaderAccess {
     fn get_headers_mut(&mut self) -> &mut Vec<(String, String)>;
 
     fn get_header(&self, name: &str) -> Option<&String> {
+        let short_name = match name.to_lowercase().as_str() {
+            "via" => Some("v"),
+            "from" => Some("f"),
+            "to" => Some("t"),
+            "call-id" => Some("i"),
+            "contact" => Some("m"),
+            "content-length" => Some("l"),
+            "content-type" => Some("c"),
+            "subject" => Some("s"),
+            "supported" => Some("k"),
+            _ => None,
+        };
+
         self.get_headers().iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case(name) ||
+                short_name.map(|s| k.eq_ignore_ascii_case(s)).unwrap_or(false)
+            })
             .map(|(_, v)| v)
     }
 
     fn get_all_headers(&self, name: &str) -> Vec<&String> {
+        let short_name = match name.to_lowercase().as_str() {
+            "via" => Some("v"),
+            "from" => Some("f"),
+            "to" => Some("t"),
+            "call-id" => Some("i"),
+            "contact" => Some("m"),
+            "content-length" => Some("l"),
+            "content-type" => Some("c"),
+            "subject" => Some("s"),
+            "supported" => Some("k"),
+            _ => None,
+        };
+
         self.get_headers().iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .filter(|(k, _)| {
+                k.eq_ignore_ascii_case(name) ||
+                short_name.map(|s| k.eq_ignore_ascii_case(s)).unwrap_or(false)
+            })
             .map(|(_, v)| v)
             .collect()
     }
@@ -139,6 +171,16 @@ impl SipHeaderAccess for SipResponse {
     fn get_headers_mut(&mut self) -> &mut Vec<(String, String)> { &mut self.headers }
 }
 
+fn split_head_body(input: &str) -> (&str, &str) {
+    if let Some(pos) = input.find("\r\n\r\n") {
+        (&input[..pos], &input[pos+4..])
+    } else if let Some(pos) = input.find("\n\n") {
+        (&input[..pos], &input[pos+2..])
+    } else {
+        (input, "")
+    }
+}
+
 impl SipRequest {
     pub fn new(method: Method, uri: &str) -> Self {
         Self {
@@ -157,34 +199,41 @@ impl SipRequest {
 
     pub fn to_string(&self) -> String {
         let mut s = format!("{} {} {}\r\n", self.method, self.uri, self.version);
+        let mut has_content_length = false;
         for (k, v) in &self.headers {
+            if k.eq_ignore_ascii_case("Content-Length") || k.eq_ignore_ascii_case("l") {
+                has_content_length = true;
+            }
             s.push_str(&format!("{}: {}\r\n", k, v));
         }
+        if !has_content_length {
+            s.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
         s.push_str("\r\n");
-        let body_str = String::from_utf8_lossy(&self.body).to_string();
-        s.push_str(&body_str);
+        if !self.body.is_empty() {
+            let body_str = String::from_utf8_lossy(&self.body).to_string();
+            s.push_str(&body_str);
+        }
         s
     }
 
     pub fn parse(input: &str) -> Option<Self> {
-        let mut lines = input.split("\r\n");
-        let first_line = lines.next()?;
+        let (head, body_str) = split_head_body(input);
+        let body = body_str.as_bytes().to_vec();
+
+        let mut head_lines = head.lines();
+        let first_line = head_lines.next()?;
         let mut parts = first_line.split_whitespace();
         let method = Method::from(parts.next()?);
         let uri = parts.next()?.to_string();
         let version = parts.next()?.to_string();
 
         let mut headers = Vec::new();
-        while let Some(line) = lines.next() {
-            if line.is_empty() {
-                break;
-            }
+        for line in head_lines {
             if let Some((k, v)) = line.split_once(':') {
                 headers.push((k.trim().to_string(), v.trim().to_string()));
             }
         }
-
-        let body = lines.collect::<Vec<&str>>().join("\r\n").into_bytes();
 
         Some(SipRequest {
             method,
@@ -214,34 +263,41 @@ impl SipResponse {
 
     pub fn to_string(&self) -> String {
         let mut s = format!("{} {} {}\r\n", self.version, self.status_code, self.reason);
+        let mut has_content_length = false;
         for (k, v) in &self.headers {
+            if k.eq_ignore_ascii_case("Content-Length") || k.eq_ignore_ascii_case("l") {
+                has_content_length = true;
+            }
             s.push_str(&format!("{}: {}\r\n", k, v));
         }
+        if !has_content_length {
+            s.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
         s.push_str("\r\n");
-        let body_str = String::from_utf8_lossy(&self.body).to_string();
-        s.push_str(&body_str);
+        if !self.body.is_empty() {
+            let body_str = String::from_utf8_lossy(&self.body).to_string();
+            s.push_str(&body_str);
+        }
         s
     }
 
     pub fn parse(input: &str) -> Option<Self> {
-        let mut lines = input.split("\r\n");
-        let first_line = lines.next()?;
+        let (head, body_str) = split_head_body(input);
+        let body = body_str.as_bytes().to_vec();
+
+        let mut head_lines = head.lines();
+        let first_line = head_lines.next()?;
         let mut parts = first_line.split_whitespace();
         let version = parts.next()?.to_string();
         let status_code = parts.next()?.parse().ok()?;
         let reason = parts.collect::<Vec<&str>>().join(" ");
 
         let mut headers = Vec::new();
-        while let Some(line) = lines.next() {
-            if line.is_empty() {
-                break;
-            }
+        for line in head_lines {
             if let Some((k, v)) = line.split_once(':') {
                 headers.push((k.trim().to_string(), v.trim().to_string()));
             }
         }
-
-        let body = lines.collect::<Vec<&str>>().join("\r\n").into_bytes();
 
         Some(SipResponse {
             status_code,
@@ -255,10 +311,13 @@ impl SipResponse {
 
 impl SipMessage {
     pub fn parse(input: &str) -> Option<Self> {
-        if input.starts_with("SIP/2.0") {
-            SipResponse::parse(input).map(SipMessage::Response)
+        let trimmed = input.trim_start();
+        if trimmed.is_empty() { return None; }
+
+        if trimmed.starts_with("SIP/") {
+            SipResponse::parse(trimmed).map(SipMessage::Response)
         } else {
-            SipRequest::parse(input).map(SipMessage::Request)
+            SipRequest::parse(trimmed).map(SipMessage::Request)
         }
     }
 
@@ -266,6 +325,13 @@ impl SipMessage {
         match self {
             SipMessage::Request(req) => req.to_string(),
             SipMessage::Response(res) => res.to_string(),
+        }
+    }
+
+    pub fn call_id(&self) -> Option<&String> {
+        match self {
+            SipMessage::Request(req) => req.call_id(),
+            SipMessage::Response(res) => res.call_id(),
         }
     }
 }
@@ -302,6 +368,32 @@ mod tests {
     }
 
     #[test]
+    fn test_short_headers() {
+        let raw = "SIP/2.0 200 OK\r\ni: 12345\r\nf: <sip:alice@atlanta.com>;tag=123\r\nt: <sip:bob@biloxi.com>\r\nl: 0\r\n\r\n";
+        let msg = SipMessage::parse(raw).unwrap();
+        if let SipMessage::Response(res) = msg {
+            assert_eq!(res.call_id().unwrap(), "12345");
+            assert_eq!(res.from().unwrap(), "<sip:alice@atlanta.com>;tag=123");
+            assert_eq!(res.to().unwrap(), "<sip:bob@biloxi.com>");
+            assert_eq!(res.content_length().unwrap(), 0);
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[test]
+    fn test_mixed_line_endings() {
+        let raw = "SIP/2.0 200 OK\nv: SIP/2.0/UDP 127.0.0.1:5060\ni: 12345\n\nBody";
+        let msg = SipMessage::parse(raw).unwrap();
+        if let SipMessage::Response(res) = msg {
+            assert_eq!(res.call_id().unwrap(), "12345");
+            assert_eq!(res.body, b"Body");
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[test]
     fn test_duplicate_headers() {
         let mut req = SipRequest::new(Method::Invite, "sip:alice@atlanta.com");
         req.add_header("Via", "SIP/2.0/UDP 127.0.0.1:5060");
@@ -327,6 +419,7 @@ mod tests {
         let s = req.to_string();
         assert!(s.contains("INVITE sip:alice@atlanta.com SIP/2.0"));
         assert!(s.contains("From: sip:bob@biloxi.com"));
+        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
@@ -347,6 +440,7 @@ mod tests {
         let s = res.to_string();
         assert!(s.contains("SIP/2.0 200 OK"));
         assert!(s.contains("To: sip:alice@atlanta.com"));
+        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
