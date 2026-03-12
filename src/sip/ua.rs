@@ -8,7 +8,7 @@ use tokio::time::{timeout, Duration};
 use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::{Arc, Mutex as StdMutex};
 use uuid::Uuid;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 
@@ -49,15 +49,19 @@ impl SipDispatcher {
         };
 
         if let Some(cid) = call_id {
-            let mut subs = self.subscriptions.lock().unwrap();
+            let subs = self.subscriptions.lock().unwrap();
             if let Some(tx) = subs.get(&cid) {
-                let _ = tx.try_send(msg);
+                if let Err(_) = tx.try_send(msg) {
+                    debug!("Dispatcher: Channel full or closed for Call-ID {}", cid);
+                }
+            } else {
+                debug!("Dispatcher: No subscriber for Call-ID {}", cid);
             }
         }
     }
 
     pub fn subscribe(&self, call_id: String) -> mpsc::Receiver<SipMessage> {
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(100);
         let mut subs = self.subscriptions.lock().unwrap();
         subs.insert(call_id, tx);
         rx
@@ -124,7 +128,7 @@ impl UserAgent {
         let mut rx = self.dispatcher.subscribe(cid.clone());
 
         self.cseq += 1;
-        let req = SipRequest::new(Method::Register, &uri)
+        let mut req = SipRequest::new(Method::Register, &uri)
             .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", &format!("<sip:{}@{}>", self.account.username, self.account.domain))
@@ -135,74 +139,70 @@ impl UserAgent {
             .with_header("User-Agent", "Softphone/0.1.0")
             .with_header("Expires", "3600");
 
+        info!("Sending REGISTER to {} (Call-ID: {})", server_addr, cid);
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
-        let res = match timeout(Duration::from_secs(5), rx.recv()).await {
-            Ok(Some(SipMessage::Response(res))) => res,
-            _ => {
-                self.reg_state = RegistrationState::Failed("Timeout waiting for response".to_string());
-                self.dispatcher.unsubscribe(&cid);
-                return Err(anyhow!("Timeout waiting for response"));
-            }
-        };
-
-        match res.status_code {
-            200 => {
-                self.reg_state = RegistrationState::Registered;
-                info!("Registered successfully");
-            }
-            401 | 407 => {
-                let auth_header_name = if res.status_code == 401 { "WWW-Authenticate" } else { "Proxy-Authenticate" };
-                let authenticate = res.get_header(auth_header_name).ok_or_else(|| anyhow!("Missing Authentication header"))?;
-
-                let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
-                let nonce = authenticate.split("nonce=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
-                let qop = authenticate.split("qop=\"").nth(1).and_then(|s| s.split('\"').next());
-
-                let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
-                let method_str = Method::Register.to_string();
-
-                let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
-                    self.account.username, realm, nonce, uri);
-
-                if let Some(_q) = qop.filter(|&q| q.contains("auth")) {
-                    let cnonce = Uuid::new_v4().to_string()[..8].to_string();
-                    let nc = "00000001";
-                    let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", &method_str, &uri);
-                    auth_val.push_str(&format!(", qop=\"auth\", nc={}, cnonce=\"{}\", response=\"{}\"", nc, cnonce, response));
-                } else {
-                    let response = calculate_digest_response(&self.account.username, password, realm, nonce, &method_str, &uri);
-                    auth_val.push_str(&format!(", response=\"{}\"", response));
+        let mut retry_count = 0;
+        loop {
+            let msg = match timeout(Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(msg)) => msg,
+                _ => {
+                    warn!("Timeout waiting for REGISTER response");
+                    self.reg_state = RegistrationState::Failed("Timeout waiting for response".to_string());
+                    break;
                 }
+            };
 
-                self.cseq += 1;
-                let auth_req = req.clone()
-                    .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
-                    .with_header("CSeq", &format!("{} REGISTER", self.cseq))
-                    .with_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+            if let SipMessage::Response(res) = msg {
+                info!("Received {} {} for REGISTER", res.status_code, res.reason);
 
-                self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
-
-                let final_res = match timeout(Duration::from_secs(5), rx.recv()).await {
-                    Ok(Some(SipMessage::Response(res))) => res,
-                    _ => {
-                        self.reg_state = RegistrationState::Failed("Timeout waiting for auth response".to_string());
-                        self.dispatcher.unsubscribe(&cid);
-                        return Err(anyhow!("Timeout waiting for auth response"));
-                    }
-                };
-
-                if final_res.status_code == 200 {
+                if res.status_code == 100 {
+                    continue;
+                }
+                if res.status_code == 200 {
                     self.reg_state = RegistrationState::Registered;
-                    info!("Registered successfully (with auth)");
-                } else {
-                    self.reg_state = RegistrationState::Failed(format!("Status {}", final_res.status_code));
-                    error!("Registration failed with status {}", final_res.status_code);
+                    info!("Registered successfully");
+                    break;
                 }
-            }
-            _ => {
-                self.reg_state = RegistrationState::Failed(format!("Status {}", res.status_code));
-                warn!("Registration failed with status {}", res.status_code);
+                if (res.status_code == 401 || res.status_code == 407) && retry_count < 3 {
+                    retry_count += 1;
+                    let auth_header_name = if res.status_code == 401 { "WWW-Authenticate" } else { "Proxy-Authenticate" };
+                    if let Some(authenticate) = res.get_header(auth_header_name) {
+                        let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                        let nonce = authenticate.split("nonce=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                        let qop = authenticate.split("qop=\"").nth(1).and_then(|s| s.split('\"').next());
+
+                        let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
+                        let method_str = Method::Register.to_string();
+
+                        let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
+                            self.account.username, realm, nonce, uri);
+
+                        if let Some(_q) = qop.filter(|&q| q.contains("auth")) {
+                            let cnonce = Uuid::new_v4().to_string()[..8].to_string();
+                            let nc = "00000001";
+                            let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", &method_str, &uri);
+                            auth_val.push_str(&format!(", qop=\"auth\", nc={}, cnonce=\"{}\", response=\"{}\"", nc, cnonce, response));
+                        } else {
+                            let response = calculate_digest_response(&self.account.username, password, realm, nonce, &method_str, &uri);
+                            auth_val.push_str(&format!(", response=\"{}\"", response));
+                        }
+
+                        self.cseq += 1;
+                        req.set_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()));
+                        req.set_header("CSeq", &format!("{} REGISTER", self.cseq));
+                        req.set_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+
+                        info!("Retrying REGISTER with auth (retry {}) to {}", retry_count, server_addr);
+                        self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
+                        continue;
+                    }
+                }
+                if res.status_code >= 400 {
+                    self.reg_state = RegistrationState::Failed(format!("Status {}", res.status_code));
+                    error!("Registration failed with status {}: {}", res.status_code, res.reason);
+                    break;
+                }
             }
         }
 
@@ -242,7 +242,7 @@ impl UserAgent {
 
         req.body = sdp_str.into_bytes();
 
-        info!("Sending INVITE to {} for {}", server_addr, remote_uri);
+        info!("Sending INVITE to {} for {} (Call-ID: {})", server_addr, remote_uri, cid);
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
         self.active_calls.push(Call {
@@ -327,13 +327,12 @@ impl UserAgent {
                         }
 
                         self.cseq += 1;
-                        let mut auth_req = req.clone();
-                        auth_req.set_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()));
-                        auth_req.set_header("CSeq", &format!("{} INVITE", self.cseq));
-                        auth_req.set_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+                        req.set_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()));
+                        req.set_header("CSeq", &format!("{} INVITE", self.cseq));
+                        req.set_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
 
                         info!("Retrying INVITE with auth (retry {}) to {}", retry_count, server_addr);
-                        self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
+                        self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
                         continue;
                     }
                 }

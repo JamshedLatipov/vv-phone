@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc};
 use std::collections::HashMap;
 use tokio::net::tcp::{OwnedWriteHalf};
+use tracing::{warn, error};
 
 #[async_trait]
 pub trait SipTransport: Send + Sync {
@@ -29,8 +30,16 @@ impl SipUdpTransport {
         let socket_clone = socket.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 8192];
-            while let Ok((n, addr)) = socket_clone.recv_from(&mut buf).await {
-                if tx.send((buf[..n].to_vec(), addr)).await.is_err() { break; }
+            loop {
+                match socket_clone.recv_from(&mut buf).await {
+                    Ok((n, addr)) => {
+                        if tx.send((buf[..n].to_vec(), addr)).await.is_err() { break; }
+                    }
+                    Err(e) => {
+                        warn!("UDP recv_from error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                }
             }
         });
 

@@ -8,7 +8,7 @@ use clap::Parser;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
 use std::net::ToSocketAddrs;
-use tracing::{info, Level, error};
+use tracing::{info, Level, error, debug};
 use tracing_subscriber::FmtSubscriber;
 use tokio::sync::mpsc;
 
@@ -66,10 +66,21 @@ async fn main() -> anyhow::Result<()> {
     };
     tokio::spawn(async move {
         let mut buf = [0u8; 8192];
-        while let Ok((n, _addr)) = transport_dispatch.recv_from(&mut buf).await {
-            let data = String::from_utf8_lossy(&buf[..n]);
-            if let Some(msg) = SipMessage::parse(&data) {
-                dispatcher.dispatch(msg);
+        loop {
+            match transport_dispatch.recv_from(&mut buf).await {
+                Ok((n, addr)) => {
+                    let data = String::from_utf8_lossy(&buf[..n]);
+                    debug!("Received {} bytes from {}: {}", n, addr, data);
+                    if let Some(msg) = SipMessage::parse(&data) {
+                        dispatcher.dispatch(msg);
+                    } else {
+                        debug!("Failed to parse SIP message from {}", addr);
+                    }
+                }
+                Err(e) => {
+                    error!("Transport receive error: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                }
             }
         }
     });
