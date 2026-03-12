@@ -101,6 +101,8 @@ pub trait SipHeaderAccess {
             "contact" => Some("m"),
             "content-length" => Some("l"),
             "content-type" => Some("c"),
+            "subject" => Some("s"),
+            "supported" => Some("k"),
             _ => None,
         };
 
@@ -121,6 +123,8 @@ pub trait SipHeaderAccess {
             "contact" => Some("m"),
             "content-length" => Some("l"),
             "content-type" => Some("c"),
+            "subject" => Some("s"),
+            "supported" => Some("k"),
             _ => None,
         };
 
@@ -167,6 +171,16 @@ impl SipHeaderAccess for SipResponse {
     fn get_headers_mut(&mut self) -> &mut Vec<(String, String)> { &mut self.headers }
 }
 
+fn split_head_body(input: &str) -> (&str, &str) {
+    if let Some(pos) = input.find("\r\n\r\n") {
+        (&input[..pos], &input[pos+4..])
+    } else if let Some(pos) = input.find("\n\n") {
+        (&input[..pos], &input[pos+2..])
+    } else {
+        (input, "")
+    }
+}
+
 impl SipRequest {
     pub fn new(method: Method, uri: &str) -> Self {
         Self {
@@ -187,7 +201,7 @@ impl SipRequest {
         let mut s = format!("{} {} {}\r\n", self.method, self.uri, self.version);
         let mut has_content_length = false;
         for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case("Content-Length") {
+            if k.eq_ignore_ascii_case("Content-Length") || k.eq_ignore_ascii_case("l") {
                 has_content_length = true;
             }
             s.push_str(&format!("{}: {}\r\n", k, v));
@@ -204,9 +218,8 @@ impl SipRequest {
     }
 
     pub fn parse(input: &str) -> Option<Self> {
-        let mut lines = input.splitn(2, "\r\n\r\n");
-        let head = lines.next()?;
-        let body = lines.next().unwrap_or("").as_bytes().to_vec();
+        let (head, body_str) = split_head_body(input);
+        let body = body_str.as_bytes().to_vec();
 
         let mut head_lines = head.lines();
         let first_line = head_lines.next()?;
@@ -252,7 +265,7 @@ impl SipResponse {
         let mut s = format!("{} {} {}\r\n", self.version, self.status_code, self.reason);
         let mut has_content_length = false;
         for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case("Content-Length") {
+            if k.eq_ignore_ascii_case("Content-Length") || k.eq_ignore_ascii_case("l") {
                 has_content_length = true;
             }
             s.push_str(&format!("{}: {}\r\n", k, v));
@@ -269,9 +282,8 @@ impl SipResponse {
     }
 
     pub fn parse(input: &str) -> Option<Self> {
-        let mut lines = input.splitn(2, "\r\n\r\n");
-        let head = lines.next()?;
-        let body = lines.next().unwrap_or("").as_bytes().to_vec();
+        let (head, body_str) = split_head_body(input);
+        let body = body_str.as_bytes().to_vec();
 
         let mut head_lines = head.lines();
         let first_line = head_lines.next()?;
@@ -370,6 +382,18 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_line_endings() {
+        let raw = "SIP/2.0 200 OK\nv: SIP/2.0/UDP 127.0.0.1:5060\ni: 12345\n\nBody";
+        let msg = SipMessage::parse(raw).unwrap();
+        if let SipMessage::Response(res) = msg {
+            assert_eq!(res.call_id().unwrap(), "12345");
+            assert_eq!(res.body, b"Body");
+        } else {
+            panic!("Expected response");
+        }
+    }
+
+    #[test]
     fn test_duplicate_headers() {
         let mut req = SipRequest::new(Method::Invite, "sip:alice@atlanta.com");
         req.add_header("Via", "SIP/2.0/UDP 127.0.0.1:5060");
@@ -395,6 +419,7 @@ mod tests {
         let s = req.to_string();
         assert!(s.contains("INVITE sip:alice@atlanta.com SIP/2.0"));
         assert!(s.contains("From: sip:bob@biloxi.com"));
+        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
@@ -415,6 +440,7 @@ mod tests {
         let s = res.to_string();
         assert!(s.contains("SIP/2.0 200 OK"));
         assert!(s.contains("To: sip:alice@atlanta.com"));
+        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
