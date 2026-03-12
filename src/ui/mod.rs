@@ -27,7 +27,6 @@ pub struct SoftphoneApp {
 
 impl eframe::App for SoftphoneApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply modern dark theme
         ctx.set_visuals(egui::Visuals::dark());
 
         egui::SidePanel::left("settings_panel")
@@ -85,12 +84,13 @@ impl eframe::App for SoftphoneApp {
                     .min_size(egui::vec2(ui.available_width(), 30.0)))
                     .clicked()
                 {
-                    // Logic to separate domain and proxy if needed.
-                    // For now, if domain contains ':', we treat it as proxy.
-                    let (domain, proxy) = if self.account_domain.contains(':') || self.account_domain.chars().any(|c| c.is_numeric()) {
-                        // Very basic heuristic: if it looks like an IP or has a port, it's likely a proxy/server address.
-                        // We still need a domain for the From/To headers.
-                        ("example.com".to_string(), Some(self.account_domain.clone()))
+                    // Logic to separate domain and proxy.
+                    let (domain, proxy) = if let Some((d, p)) = self.account_domain.split_once('/') {
+                        (d.trim().to_string(), Some(p.trim().to_string()))
+                    } else if self.account_domain.contains(':') || self.account_domain.chars().any(|c| c.is_numeric()) {
+                        // Heuristic: If it has port or looks like IP, it is likely both domain and proxy/target.
+                        // We use the input as both for simplicity if it is not split.
+                        (self.account_domain.clone(), Some(self.account_domain.clone()))
                     } else {
                         (self.account_domain.clone(), None)
                     };
@@ -159,10 +159,20 @@ impl SoftphoneApp {
             }
         });
 
+        let display_domain = if let Some(p) = &initial_account.proxy {
+            if p != &initial_account.domain {
+                format!("{} / {}", initial_account.domain, p)
+            } else {
+                initial_account.domain.clone()
+            }
+        } else {
+            initial_account.domain.clone()
+        };
+
         Self {
             account_name: initial_account.name,
             account_username: initial_account.username,
-            account_domain: initial_account.proxy.unwrap_or(initial_account.domain),
+            account_domain: display_domain,
             account_password: initial_account.password.unwrap_or_default(),
             bind_address: initial_config.connection.bind_address,
             transport_type: initial_config.connection.transport_type,

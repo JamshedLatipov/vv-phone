@@ -5,7 +5,7 @@ use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop}
 use crate::media::sdp::{SdpSession, SdpMediaDescription};
 use anyhow::{Result, anyhow};
 use tokio::time::{timeout, Duration};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::Arc;
 use uuid::Uuid;
 use tracing::{info, warn, error};
@@ -46,12 +46,23 @@ impl UserAgent {
         }
     }
 
+    fn get_public_local_addr(&self, target: SocketAddr) -> String {
+        let socket = StdUdpSocket::bind("0.0.0.0:0").ok();
+        let local_ip = socket.and_then(|s| {
+            s.connect(target).ok()?;
+            s.local_addr().ok()
+        }).map(|a| a.ip().to_string()).unwrap_or_else(|| "127.0.0.1".to_string());
+
+        let port = self.transport.local_addr().map(|a| a.port()).unwrap_or(5060);
+        format!("{}:{}", local_ip, port)
+    }
+
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
         self.reg_state = RegistrationState::Registering;
         info!("Registration started for {}", self.account.username);
 
         let uri = format!("sip:{}", self.account.domain);
-        let local_addr = self.transport.local_addr()?.to_string();
+        let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol();
 
         let req = SipRequest::new(Method::Register, &uri)
@@ -62,6 +73,7 @@ impl UserAgent {
             .with_header("CSeq", &format!("{} REGISTER", self.cseq))
             .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Max-Forwards", "70")
+            .with_header("User-Agent", "Softphone/0.1.0")
             .with_header("Expires", "3600");
 
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
@@ -144,7 +156,7 @@ impl UserAgent {
     pub async fn invite(&mut self, remote_uri: &str, server_addr: SocketAddr) -> Result<()> {
         let call_id = Uuid::new_v4().to_string();
         self.cseq += 1;
-        let local_addr = self.transport.local_addr()?.to_string();
+        let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol();
 
         let mut sdp = SdpSession::new(&self.account.username, "CallSession", &local_addr.split(':').next().unwrap_or("0.0.0.0"));
@@ -157,7 +169,7 @@ impl UserAgent {
         });
         let sdp_str = sdp.to_string();
 
-        let req = SipRequest::new(Method::Invite, remote_uri)
+        let mut req = SipRequest::new(Method::Invite, remote_uri)
             .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-invite-{}", proto, local_addr, Uuid::new_v4()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", &format!("<{}>", remote_uri))
@@ -165,18 +177,91 @@ impl UserAgent {
             .with_header("CSeq", &format!("{} INVITE", self.cseq))
             .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
             .with_header("Content-Type", "application/sdp")
+            .with_header("User-Agent", "Softphone/0.1.0")
             .with_header("Max-Forwards", "70");
 
-        let mut req = req;
         req.body = sdp_str.into_bytes();
 
+        info!("Sending INVITE to {} for {}", server_addr, remote_uri);
+        self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
+
         self.active_calls.push(Call {
-            id: call_id,
+            id: call_id.clone(),
             state: CallState::Calling,
             remote_uri: remote_uri.to_string(),
         });
 
-        self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
+        // Wait for response and handle auth challenges
+        let mut buf = [0u8; 4096];
+        loop {
+            let (len, _addr) = match timeout(Duration::from_secs(10), self.transport.recv_from(&mut buf)).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    warn!("Timeout waiting for INVITE response");
+                    break;
+                }
+            };
+            let resp_str = String::from_utf8_lossy(&buf[..len]);
+            if let Some(SipMessage::Response(res)) = SipMessage::parse(&resp_str) {
+                info!("Received {} {} for INVITE", res.status_code, res.reason);
+                if res.status_code == 100 || res.status_code == 180 || res.status_code == 183 {
+                    if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+                        if res.status_code == 180 || res.status_code == 183 {
+                            self.active_calls[pos].state = CallState::Ringing;
+                        }
+                    }
+                    continue;
+                }
+                if res.status_code == 200 {
+                    if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+                        self.active_calls[pos].state = CallState::Connected;
+                    }
+                    // ACK should be sent here
+                    break;
+                }
+                if res.status_code == 401 || res.status_code == 407 {
+                    let auth_header_name = if res.status_code == 401 { "WWW-Authenticate" } else { "Proxy-Authenticate" };
+                    if let Some(authenticate) = res.get_header(auth_header_name) {
+                        let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                        let nonce = authenticate.split("nonce=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
+                        let qop = authenticate.split("qop=\"").nth(1).and_then(|s| s.split('\"').next());
+
+                        let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
+                        let method_str = Method::Invite.to_string();
+
+                        let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
+                            self.account.username, realm, nonce, remote_uri);
+
+                        if let Some(_q) = qop.filter(|&q| q.contains("auth")) {
+                            let cnonce = Uuid::new_v4().to_string()[..8].to_string();
+                            let nc = "00000001";
+                            let response = calculate_digest_response_qop(&self.account.username, password, realm, nonce, &cnonce, nc, "auth", &method_str, remote_uri);
+                            auth_val.push_str(&format!(", qop=\"auth\", nc={}, cnonce=\"{}\", response=\"{}\"", nc, cnonce, response));
+                        } else {
+                            let response = calculate_digest_response(&self.account.username, password, realm, nonce, &method_str, remote_uri);
+                            auth_val.push_str(&format!(", response=\"{}\"", response));
+                        }
+
+                        self.cseq += 1;
+                        let auth_req = req.clone()
+                            .with_header("CSeq", &format!("{} INVITE", self.cseq))
+                            .with_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+
+                        info!("Retrying INVITE with auth to {}", server_addr);
+                        self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
+                        continue; // Wait for next response
+                    }
+                }
+                if res.status_code >= 400 {
+                    error!("INVITE failed with status {}: {}", res.status_code, res.reason);
+                    if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
+                        self.active_calls.remove(pos);
+                    }
+                    break;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -184,7 +269,7 @@ impl UserAgent {
         if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
             let call = &self.active_calls[pos];
             self.cseq += 1;
-            let local_addr = self.transport.local_addr()?.to_string();
+            let local_addr = self.get_public_local_addr(server_addr);
             let proto = self.transport.protocol();
 
             let req = SipRequest::new(Method::Bye, &call.remote_uri)
@@ -193,6 +278,7 @@ impl UserAgent {
                 .with_header("To", &format!("<{}>", call.remote_uri))
                 .with_header("Call-ID", &call.id)
                 .with_header("CSeq", &format!("{} BYE", self.cseq))
+                .with_header("User-Agent", "Softphone/0.1.0")
                 .with_header("Max-Forwards", "70");
 
             self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
