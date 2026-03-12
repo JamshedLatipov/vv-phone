@@ -5,6 +5,7 @@ use softphone::sip::SipMessage;
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
 use softphone::media::audio::AudioSystem;
+use softphone::core::CallState;
 use clap::Parser;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
@@ -55,8 +56,9 @@ async fn main() -> anyhow::Result<()> {
     let active_calls = Arc::new(StdMutex::new(Vec::<Call>::new()));
     let audio_system = Arc::new(AudioSystem::new());
 
-    // Set initial audio device
+    // Set initial audio devices
     audio_system.set_output_device(config.audio.output_device.clone());
+    audio_system.set_input_device(config.audio.input_device.clone());
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
@@ -103,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             match cmd {
                 UiCommand::SaveConfig(new_config) => {
                     audio_system.set_output_device(new_config.audio.output_device.clone());
+                    audio_system.set_input_device(new_config.audio.input_device.clone());
                     if let Err(e) = new_config.save_to_file("config.toml") {
                         error!("Failed to save config: {}", e);
                     } else {
@@ -164,10 +167,16 @@ async fn main() -> anyhow::Result<()> {
 
                             if let Err(e) = ua_lock.invite(&uri, addr).await {
                                 error!("Invite error: {}", e);
+                                audio_invite.stop_ringtone();
+                            } else {
+                                audio_invite.stop_ringtone();
+                                // Check if call is connected
+                                if let Some(call) = ua_lock.active_calls.iter().find(|c| c.state == CallState::Connected) {
+                                    if let Some(remote_rtp) = call.remote_rtp_addr {
+                                        audio_invite.start_call_audio(remote_rtp, call.local_rtp_port.unwrap_or(4000));
+                                    }
+                                }
                             }
-
-                            // Stop ringing sound
-                            audio_invite.stop_ringtone();
 
                             let mut calls = active_calls.lock().unwrap();
                             *calls = ua_lock.active_calls.clone();
@@ -175,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 UiCommand::Hangup(id) => {
+                    let audio_hangup = audio_system.clone();
                     tokio::spawn(async move {
                         let target_addr;
                         {
@@ -192,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                             if let Err(e) = ua_lock.hangup(id, addr).await {
                                 error!("Hangup error: {}", e);
                             }
+                            audio_hangup.stop_call_audio();
                             let mut calls = active_calls.lock().unwrap();
                             *calls = ua_lock.active_calls.clone();
                         }

@@ -20,6 +20,8 @@ pub struct Call {
     pub local_tag: String,
     pub remote_tag: Option<String>,
     pub remote_contact: Option<String>,
+    pub remote_rtp_addr: Option<SocketAddr>,
+    pub local_rtp_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,63 +104,55 @@ impl UserAgent {
         }
     }
 
-    fn get_public_local_addr(&self, target: SocketAddr) -> String {
-        let socket = StdUdpSocket::bind("0.0.0.0:0").ok();
-        let local_ip = socket.and_then(|s| {
-            s.connect(target).ok()?;
-            s.local_addr().ok()
-        }).map(|a| a.ip().to_string()).unwrap_or_else(|| "127.0.0.1".to_string());
-
-        let port = self.transport.local_addr().map(|a| a.port()).unwrap_or(5060);
-        format!("{}:{}", local_ip, port)
+    fn new_branch(&self) -> String {
+        format!("z9hG4bK{}", Uuid::new_v4().to_string()[..8].to_string())
     }
 
-    fn new_branch(&self) -> String {
-        format!("z9hG4bK-{}", Uuid::new_v4())
+    fn get_public_local_addr(&self, target_server: SocketAddr) -> String {
+        let socket = match StdUdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(_) => return "127.0.0.1:5060".to_string(),
+        };
+        if socket.connect(target_server).is_err() {
+            return "127.0.0.1:5060".to_string();
+        }
+        socket.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "127.0.0.1:5060".to_string())
     }
 
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
         self.reg_state = RegistrationState::Registering;
         info!("Registration started for {}", self.account.username);
 
-        let uri = format!("sip:{}", self.account.domain);
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol().to_string();
-        let cid = self.call_id.clone();
+        let cid = Uuid::new_v4().to_string();
         let mut rx = self.dispatcher.subscribe(cid.clone());
 
-        self.cseq += 1;
-        let mut req = SipRequest::new(Method::Register, &uri)
+        let mut req = SipRequest::new(Method::Register, &format!("sip:{}", self.account.domain))
             .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
-            .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
+            .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4().to_string()[..8].to_string()))
             .with_header("To", &format!("<sip:{}@{}>", self.account.username, self.account.domain))
             .with_header("Call-ID", &cid)
             .with_header("CSeq", &format!("{} REGISTER", self.cseq))
             .with_header("Contact", &format!("<sip:{}@{}>", self.account.username, local_addr))
-            .with_header("Max-Forwards", "70")
             .with_header("User-Agent", "Softphone/0.1.0")
-            .with_header("Expires", "3600");
+            .with_header("Max-Forwards", "70");
 
         info!("Sending REGISTER to {} (Call-ID: {})", server_addr, cid);
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
         let mut retry_count = 0;
         loop {
-            let msg = match timeout(Duration::from_secs(10), rx.recv()).await {
+            let msg = match timeout(Duration::from_secs(5), rx.recv()).await {
                 Ok(Some(msg)) => msg,
                 _ => {
-                    warn!("Timeout waiting for REGISTER response");
-                    self.reg_state = RegistrationState::Failed("Timeout waiting for response".to_string());
+                    self.reg_state = RegistrationState::Failed("Timeout".to_string());
                     break;
                 }
             };
 
             if let SipMessage::Response(res) = msg {
                 info!("Received {} {} for REGISTER", res.status_code, res.reason);
-
-                if res.status_code == 100 {
-                    continue;
-                }
                 if res.status_code == 200 {
                     self.reg_state = RegistrationState::Registered;
                     info!("Registered successfully");
@@ -174,6 +168,7 @@ impl UserAgent {
 
                         let password = self.account.password.as_ref().ok_or_else(|| anyhow!("Password required"))?;
                         let method_str = Method::Register.to_string();
+                        let uri = format!("sip:{}", self.account.domain);
 
                         let mut auth_val = format!("Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\"",
                             self.account.username, realm, nonce, uri);
@@ -252,6 +247,8 @@ impl UserAgent {
             local_tag,
             remote_tag: None,
             remote_contact: None,
+            remote_rtp_addr: None,
+            local_rtp_port: Some(4000),
         });
 
         let mut retry_count = 0;
@@ -286,8 +283,25 @@ impl UserAgent {
                 if res.status_code == 200 {
                     if let Some(pos) = self.active_calls.iter().position(|c| c.id == cid) {
                         self.active_calls[pos].state = CallState::Connected;
-                        let call = self.active_calls[pos].clone();
 
+                        // Parse SDP for remote RTP address
+                        let body_str = String::from_utf8_lossy(&res.body);
+                        if let Some(remote_sdp) = SdpSession::parse(&body_str) {
+                            if let Some(media) = remote_sdp.media_descriptions.iter().find(|m| m.media_type == "audio") {
+                                let c_info = if !remote_sdp.connection_info.is_empty() {
+                                    &remote_sdp.connection_info
+                                } else {
+                                    ""
+                                };
+                                let ip = c_info.split_whitespace().last().unwrap_or("0.0.0.0");
+                                if let Ok(addr) = format!("{}:{}", ip, media.port).parse::<SocketAddr>() {
+                                    self.active_calls[pos].remote_rtp_addr = Some(addr);
+                                    info!("Negotiated RTP address: {}", addr);
+                                }
+                            }
+                        }
+
+                        let call = self.active_calls[pos].clone();
                         let ack_uri = call.remote_contact.as_ref().unwrap_or(&call.remote_uri);
                         let ack = SipRequest::new(Method::Ack, ack_uri)
                             .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
@@ -372,5 +386,21 @@ impl UserAgent {
             info!("Hung up call {}", call_id);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ua_tests {
+    use super::*;
+    use crate::media::sdp::SdpSession;
+
+    #[test]
+    fn test_sdp_rtp_address_parsing() {
+        let sdp_body = "v=0\r\no=alice 12345 67890 IN IP4 1.2.3.4\r\ns=Session\r\nc=IN IP4 1.2.3.4\r\nt=0 0\r\nm=audio 5000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let sdp = SdpSession::parse(sdp_body).unwrap();
+        let media = sdp.media_descriptions.iter().find(|m| m.media_type == "audio").unwrap();
+        let ip = sdp.connection_info.split_whitespace().last().unwrap();
+        let addr: SocketAddr = format!("{}:{}", ip, media.port).parse().unwrap();
+        assert_eq!(addr.to_string(), "1.2.3.4:5000");
     }
 }
