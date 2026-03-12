@@ -2,13 +2,15 @@ use eframe::egui;
 use crate::sip::ua::{RegistrationState, Call};
 use std::sync::{Arc, Mutex};
 use crate::core::Account;
-use crate::config::{Config, TransportType, ConnectionSettings};
+use crate::config::{Config, TransportType, ConnectionSettings, AudioSettings};
+use crate::media::audio;
 
 pub enum UiCommand {
     Register(Account),
     Invite(String),
     Hangup(String),
     SaveConfig(Config),
+    TestSpeaker,
 }
 
 pub struct SoftphoneApp {
@@ -18,11 +20,18 @@ pub struct SoftphoneApp {
     pub account_password: String,
     pub bind_address: String,
     pub transport_type: TransportType,
+    pub rtp_port_start: u16,
+    pub rtp_port_end: u16,
+    pub selected_input_device: String,
+    pub selected_output_device: String,
+    pub available_input_devices: Vec<String>,
+    pub available_output_devices: Vec<String>,
     pub dialer_input: String,
     pub call_history: Vec<String>,
     pub reg_state: Arc<Mutex<RegistrationState>>,
     pub active_calls: Arc<Mutex<Vec<Call>>>,
     pub command_sender: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    pub is_testing_speaker: bool,
 }
 
 impl eframe::App for SoftphoneApp {
@@ -71,12 +80,57 @@ impl eframe::App for SoftphoneApp {
                 ui.add_space(5.0);
 
                 ui.label("Transport");
-                egui::ComboBox::from_label("")
+                egui::ComboBox::from_label("  ")
                     .selected_text(format!("{:?}", self.transport_type))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.transport_type, TransportType::Udp, "UDP");
                         ui.selectable_value(&mut self.transport_type, TransportType::Tcp, "TCP");
                     });
+
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("RTP Start");
+                        ui.add(egui::DragValue::new(&mut self.rtp_port_start).range(1024..=65535));
+                    });
+                    ui.vertical(|ui| {
+                        ui.label("RTP End");
+                        ui.add(egui::DragValue::new(&mut self.rtp_port_end).range(1024..=65535));
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Audio").strong());
+                ui.add_space(5.0);
+
+                ui.label("Microphone");
+                egui::ComboBox::from_id_source("mic_select")
+                    .selected_text(&self.selected_input_device)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for device in &self.available_input_devices {
+                            ui.selectable_value(&mut self.selected_input_device, device.clone(), device);
+                        }
+                    });
+
+                ui.add_space(5.0);
+                ui.label("Speaker");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_source("speaker_select")
+                        .selected_text(&self.selected_output_device)
+                        .width(ui.available_width() - 40.0)
+                        .show_ui(ui, |ui| {
+                            for device in &self.available_output_devices {
+                                ui.selectable_value(&mut self.selected_output_device, device.clone(), device);
+                            }
+                        });
+
+                    if ui.button("🔊").on_hover_text("Test Speaker").clicked() {
+                        let _ = self.command_sender.send(UiCommand::TestSpeaker);
+                    }
+                });
 
                 ui.add_space(15.0);
 
@@ -84,8 +138,6 @@ impl eframe::App for SoftphoneApp {
                     .min_size(egui::vec2(ui.available_width(), 30.0)))
                     .clicked()
                 {
-                    // Logic to separate domain and proxy.
-                    // Support format: "domain / proxy" or just "domain" (which will also be proxy if it looks like IP)
                     let (domain, proxy) = if let Some((d, p)) = self.account_domain.split_once('/') {
                         (d.trim().to_string(), Some(p.trim().to_string()))
                     } else if self.account_domain.contains(':') || self.account_domain.chars().any(|c| c.is_numeric()) {
@@ -107,6 +159,12 @@ impl eframe::App for SoftphoneApp {
                         connection: ConnectionSettings {
                             bind_address: self.bind_address.clone(),
                             transport_type: self.transport_type.clone(),
+                            rtp_port_start: self.rtp_port_start,
+                            rtp_port_end: self.rtp_port_end,
+                        },
+                        audio: AudioSettings {
+                            input_device: Some(self.selected_input_device.clone()),
+                            output_device: Some(self.selected_output_device.clone()),
                         },
                     };
 
@@ -168,6 +226,14 @@ impl SoftphoneApp {
             initial_account.domain.clone()
         };
 
+        let available_input_devices = audio::list_input_devices();
+        let available_output_devices = audio::list_output_devices();
+
+        let selected_input_device = initial_config.audio.input_device.clone()
+            .unwrap_or_else(|| available_input_devices.first().cloned().unwrap_or_else(|| "Default".to_string()));
+        let selected_output_device = initial_config.audio.output_device.clone()
+            .unwrap_or_else(|| available_output_devices.first().cloned().unwrap_or_else(|| "Default".to_string()));
+
         Self {
             account_name: initial_account.name,
             account_username: initial_account.username,
@@ -175,11 +241,18 @@ impl SoftphoneApp {
             account_password: initial_account.password.unwrap_or_default(),
             bind_address: initial_config.connection.bind_address,
             transport_type: initial_config.connection.transport_type,
+            rtp_port_start: initial_config.connection.rtp_port_start,
+            rtp_port_end: initial_config.connection.rtp_port_end,
+            selected_input_device,
+            selected_output_device,
+            available_input_devices,
+            available_output_devices,
             dialer_input: String::new(),
             call_history: Vec::new(),
             reg_state,
             active_calls,
             command_sender,
+            is_testing_speaker: false,
         }
     }
 

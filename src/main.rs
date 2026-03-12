@@ -4,6 +4,8 @@ use softphone::sip::ua::{UserAgent, RegistrationState, Call};
 use softphone::sip::SipMessage;
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
+use softphone::media::audio::AudioSystem;
+use softphone::core::CallState;
 use clap::Parser;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
@@ -52,13 +54,21 @@ async fn main() -> anyhow::Result<()> {
 
     let reg_state = Arc::new(StdMutex::new(RegistrationState::Unregistered));
     let active_calls = Arc::new(StdMutex::new(Vec::<Call>::new()));
+    let audio_system = Arc::new(AudioSystem::new());
+
+    audio_system.set_output_device(config.audio.output_device.clone());
+    audio_system.set_input_device(config.audio.input_device.clone());
+
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
-    let ua = Arc::new(TokioMutex::new(UserAgent::new(initial_account.clone(), transport.clone())));
+    let mut user_agent = UserAgent::new(initial_account.clone(), transport.clone());
+    user_agent.rtp_port_start = config.connection.rtp_port_start;
+    user_agent.rtp_port_end = config.connection.rtp_port_end;
+    let ua = Arc::new(TokioMutex::new(user_agent));
+
     let reg_state_clone = reg_state.clone();
     let active_calls_clone = active_calls.clone();
 
-    // Receiver task to dispatch packets to UserAgent without holding UA lock
     let transport_dispatch = transport.clone();
     let dispatcher = {
         let ua_lock = ua.lock().await;
@@ -73,8 +83,6 @@ async fn main() -> anyhow::Result<()> {
                     debug!("Received {} bytes from {}: {}", n, addr, data);
                     if let Some(msg) = SipMessage::parse(&data) {
                         dispatcher.dispatch(msg);
-                    } else {
-                        debug!("Failed to parse SIP message from {}", addr);
                     }
                 }
                 Err(e) => {
@@ -85,15 +93,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Background task for command handling
+    let audio_system_cmd = audio_system.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let ua = ua.clone();
             let reg_state = reg_state.clone();
             let active_calls = active_calls.clone();
+            let audio_system = audio_system_cmd.clone();
 
             match cmd {
                 UiCommand::SaveConfig(new_config) => {
+                    audio_system.set_output_device(new_config.audio.output_device.clone());
+                    audio_system.set_input_device(new_config.audio.input_device.clone());
+                    {
+                        let mut ua_lock = ua.lock().await;
+                        ua_lock.rtp_port_start = new_config.connection.rtp_port_start;
+                        ua_lock.rtp_port_end = new_config.connection.rtp_port_end;
+                    }
                     if let Err(e) = new_config.save_to_file("config.toml") {
                         error!("Failed to save config: {}", e);
                     } else {
@@ -118,18 +134,17 @@ async fn main() -> anyhow::Result<()> {
                             let mut state = reg_state.lock().unwrap();
                             *state = ua_lock.reg_state.clone();
                         } else {
-                            error!("Could not resolve server address for {}", target);
                             let mut state = reg_state.lock().unwrap();
                             *state = RegistrationState::Failed(format!("DNS resolution failed for {}", target));
                         }
                     });
                 }
                 UiCommand::Invite(mut uri) => {
+                    let audio_invite = audio_system.clone();
                     tokio::spawn(async move {
                         let target_addr;
                         {
                             let ua_lock = ua.lock().await;
-
                             let target = ua_lock.account.proxy.as_ref().unwrap_or(&ua_lock.account.domain);
                             target_addr = if target.contains(':') {
                                 target.to_socket_addrs().ok()
@@ -138,25 +153,38 @@ async fn main() -> anyhow::Result<()> {
                             }.and_then(|mut addrs| addrs.next());
 
                             if !uri.starts_with("sip:") {
-                                if uri.contains('@') {
-                                    uri = format!("sip:{}", uri);
-                                } else {
-                                    uri = format!("sip:{}@{}", uri, target);
-                                }
+                                if uri.contains('@') { uri = format!("sip:{}", uri); }
+                                else { uri = format!("sip:{}@{}", uri, target); }
                             }
                         }
 
                         if let Some(addr) = target_addr {
                             let mut ua_lock = ua.lock().await;
+                            audio_invite.play_ringtone();
+
                             if let Err(e) = ua_lock.invite(&uri, addr).await {
                                 error!("Invite error: {}", e);
+                                audio_invite.stop_ringtone();
+                            } else {
+                                audio_invite.stop_ringtone();
+                                let connected_call = ua_lock.active_calls.iter().find(|c| c.state == CallState::Connected).cloned();
+                                if let Some(call) = connected_call {
+                                    if let Some(remote_rtp) = call.remote_rtp_addr {
+                                        info!("Starting RTP to negotiated address: {}", remote_rtp);
+                                        audio_invite.start_call_audio(remote_rtp, call.local_rtp_port.unwrap_or(10000));
+                                    } else {
+                                        error!("Call connected but no remote RTP address negotiated!");
+                                    }
+                                }
                             }
+
                             let mut calls = active_calls.lock().unwrap();
                             *calls = ua_lock.active_calls.clone();
                         }
                     });
                 }
                 UiCommand::Hangup(id) => {
+                    let audio_hangup = audio_system.clone();
                     tokio::spawn(async move {
                         let target_addr;
                         {
@@ -174,9 +202,19 @@ async fn main() -> anyhow::Result<()> {
                             if let Err(e) = ua_lock.hangup(id, addr).await {
                                 error!("Hangup error: {}", e);
                             }
+                            audio_hangup.stop_call_audio();
                             let mut calls = active_calls.lock().unwrap();
                             *calls = ua_lock.active_calls.clone();
                         }
+                    });
+                }
+                UiCommand::TestSpeaker => {
+                    let audio_test = audio_system.clone();
+                    tokio::spawn(async move {
+                        info!("Triggering manual speaker test...");
+                        audio_test.play_test_sound();
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        audio_test.stop_test_sound();
                     });
                 }
             }

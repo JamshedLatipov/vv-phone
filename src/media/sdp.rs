@@ -17,6 +17,7 @@ pub struct SdpMediaDescription {
     pub transport: String,
     pub formats: Vec<String>,
     pub attributes: Vec<String>,
+    pub connection_info: Option<String>,
 }
 
 impl SdpSession {
@@ -43,6 +44,9 @@ impl SdpSession {
         s.push_str(&format!("t={}\r\n", self.time_description));
         for media in &self.media_descriptions {
             s.push_str(&format!("m={} {} {} {}\r\n", media.media_type, media.port, media.transport, media.formats.join(" ")));
+            if let Some(c) = &media.connection_info {
+                s.push_str(&format!("c={}\r\n", c));
+            }
             for attr in &media.attributes {
                 s.push_str(&format!("a={}\r\n", attr));
             }
@@ -52,38 +56,48 @@ impl SdpSession {
 
     pub fn parse(input: &str) -> Option<Self> {
         let mut session = SdpSession::new("", "", "");
+        session.connection_info.clear();
         let mut current_media: Option<SdpMediaDescription> = None;
 
         for line in input.lines() {
+            let line = line.trim();
             if line.is_empty() { continue; }
-            let (k, v) = line.split_once('=')?;
-            match k {
-                "v" => session.version = v.parse().ok()?,
-                "o" => session.owner = v.to_string(),
-                "s" => session.session_name = v.to_string(),
-                "c" => session.connection_info = v.to_string(),
-                "t" => session.time_description = v.to_string(),
-                "m" => {
-                    if let Some(m) = current_media.take() {
-                        session.media_descriptions.push(m);
+            if let Some((k, v)) = line.split_once('=') {
+                match k {
+                    "v" => session.version = v.parse().ok()?,
+                    "o" => session.owner = v.to_string(),
+                    "s" => session.session_name = v.to_string(),
+                    "c" => {
+                        if let Some(ref mut m) = current_media {
+                            m.connection_info = Some(v.to_string());
+                        } else {
+                            session.connection_info = v.to_string();
+                        }
                     }
-                    let parts: Vec<&str> = v.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        current_media = Some(SdpMediaDescription {
-                            media_type: parts[0].to_string(),
-                            port: parts[1].parse().ok()?,
-                            transport: parts[2].to_string(),
-                            formats: parts[3..].iter().map(|s| s.to_string()).collect(),
-                            attributes: Vec::new(),
-                        });
+                    "t" => session.time_description = v.to_string(),
+                    "m" => {
+                        if let Some(m) = current_media.take() {
+                            session.media_descriptions.push(m);
+                        }
+                        let parts: Vec<&str> = v.split_whitespace().collect();
+                        if parts.len() >= 4 {
+                            current_media = Some(SdpMediaDescription {
+                                media_type: parts[0].to_string(),
+                                port: parts[1].parse().ok()?,
+                                transport: parts[2].to_string(),
+                                formats: parts[3..].iter().map(|s| s.to_string()).collect(),
+                                attributes: Vec::new(),
+                                connection_info: None,
+                            });
+                        }
                     }
+                    "a" => {
+                        if let Some(ref mut m) = current_media {
+                            m.attributes.push(v.to_string());
+                        }
+                    }
+                    _ => {}
                 }
-                "a" => {
-                    if let Some(ref mut m) = current_media {
-                        m.attributes.push(v.to_string());
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -126,6 +140,7 @@ impl SdpSession {
                         transport: my_media.transport.clone(),
                         formats: common_formats,
                         attributes: common_attributes,
+                        connection_info: None,
                     });
                 }
             }
@@ -156,6 +171,7 @@ mod tests {
                 "rtpmap:8 PCMA/8000".to_string(),
                 "rtpmap:96 OPUS/48000/2".to_string(),
             ],
+            connection_info: None,
         });
 
         let mut answer = SdpSession::new("bob", "Answer", "127.0.0.2");
@@ -168,6 +184,7 @@ mod tests {
                 "rtpmap:96 OPUS/48000/2".to_string(),
                 "rtpmap:0 PCMU/8000".to_string(),
             ],
+            connection_info: None,
         });
 
         let negotiated = offer.negotiate(&answer).unwrap();
