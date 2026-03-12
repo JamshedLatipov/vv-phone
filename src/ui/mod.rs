@@ -10,6 +10,7 @@ pub enum UiCommand {
     Invite(String),
     Hangup(String),
     SaveConfig(Config),
+    TestSpeaker,
 }
 
 pub struct SoftphoneApp {
@@ -30,6 +31,7 @@ pub struct SoftphoneApp {
     pub reg_state: Arc<Mutex<RegistrationState>>,
     pub active_calls: Arc<Mutex<Vec<Call>>>,
     pub command_sender: tokio::sync::mpsc::UnboundedSender<UiCommand>,
+    pub is_testing_speaker: bool,
 }
 
 impl eframe::App for SoftphoneApp {
@@ -115,14 +117,20 @@ impl eframe::App for SoftphoneApp {
 
                 ui.add_space(5.0);
                 ui.label("Speaker");
-                egui::ComboBox::from_id_source("speaker_select")
-                    .selected_text(&self.selected_output_device)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for device in &self.available_output_devices {
-                            ui.selectable_value(&mut self.selected_output_device, device.clone(), device);
-                        }
-                    });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_source("speaker_select")
+                        .selected_text(&self.selected_output_device)
+                        .width(ui.available_width() - 40.0)
+                        .show_ui(ui, |ui| {
+                            for device in &self.available_output_devices {
+                                ui.selectable_value(&mut self.selected_output_device, device.clone(), device);
+                            }
+                        });
+
+                    if ui.button("🔊").on_hover_text("Test Speaker").clicked() {
+                        let _ = self.command_sender.send(UiCommand::TestSpeaker);
+                    }
+                });
 
                 ui.add_space(15.0);
 
@@ -244,6 +252,7 @@ impl SoftphoneApp {
             reg_state,
             active_calls,
             command_sender,
+            is_testing_speaker: false,
         }
     }
 

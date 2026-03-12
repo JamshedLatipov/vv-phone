@@ -50,19 +50,24 @@ impl Resampler {
     }
 
     pub fn resample(&mut self, input: &[f32], output: &mut [f32]) -> (usize, usize) {
+        if input.is_empty() || output.is_empty() {
+            return (0, 0);
+        }
         let ratio = self.source_rate / self.target_rate;
         let mut in_idx = 0;
         let mut out_idx = 0;
 
-        while out_idx < output.len() && (in_idx as f32 + self.phase) < input.len() as f32 {
+        while out_idx < output.len() {
             let current_in = in_idx as f32 + self.phase;
             let i = current_in.floor() as usize;
-            let frac = current_in - current_in.floor();
 
-            let next_i = if i + 1 < input.len() { i + 1 } else { i };
+            if i + 1 >= input.len() {
+                self.phase = current_in - in_idx as f32;
+                break;
+            }
 
-            // Linear interpolation
-            output[out_idx] = input[i] * (1.0 - frac) + input[next_i] * frac;
+            let frac = current_in - i as f32;
+            output[out_idx] = input[i] * (1.0 - frac) + input[i + 1] * frac;
 
             out_idx += 1;
             self.phase += ratio;

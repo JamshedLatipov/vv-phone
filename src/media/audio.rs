@@ -1,5 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use tracing::{info, error, debug};
+use tracing::{info, error};
 use std::net::{UdpSocket, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
@@ -33,6 +33,8 @@ pub enum AudioCommand {
     SetInputDevice(Option<String>),
     PlayRingtone,
     StopRingtone,
+    PlayTestSound,
+    StopTestSound,
     StartCallAudio {
         remote_rtp: SocketAddr,
         local_port: u16,
@@ -57,7 +59,7 @@ impl JitterBuffer {
         }
     }
 
-    fn push(&mut self, mut data: Vec<f32>) {
+    fn push(&mut self, data: Vec<f32>) {
         if self.samples.len() + data.len() > self.max_size {
             let to_remove = (self.samples.len() + data.len()) - self.max_size;
             self.samples.drain(0..to_remove);
@@ -75,6 +77,38 @@ impl JitterBuffer {
     }
 }
 
+fn build_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    jb: Arc<Mutex<JitterBuffer>>,
+    source_rate: f32,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample {
+    let channels = config.channels as usize;
+    let target_rate = config.sample_rate.0 as f32;
+    let mut resampler = Resampler::new(source_rate, target_rate);
+
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            let samples_needed = data.len() / channels;
+            let source_needed = (samples_needed as f32 * (source_rate / target_rate)).ceil() as usize + 10;
+
+            let source_samples = jb.lock().unwrap().pop(source_needed);
+            let mut resampled = vec![0.0f32; samples_needed];
+            resampler.resample(&source_samples, &mut resampled);
+
+            for (i, frame) in data.chunks_mut(channels).enumerate() {
+                let s = if i < resampled.len() { resampled[i] * 0.8 } else { 0.0 };
+                let sample = T::from_sample(s);
+                for out in frame.iter_mut() { *out = sample; }
+            }
+        },
+        |err| error!("Output audio stream error: {}", err),
+        None
+    )
+}
+
 impl AudioSystem {
     pub fn new() -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AudioCommand>();
@@ -83,7 +117,7 @@ impl AudioSystem {
             let host = cpal::default_host();
             let mut output_device: Option<cpal::Device> = host.default_output_device();
             let mut input_device: Option<cpal::Device> = host.default_input_device();
-            let mut ring_stream: Option<cpal::Stream> = None;
+            let mut active_stream: Option<cpal::Stream> = None;
             let mut call_output_stream: Option<cpal::Stream> = None;
             let mut call_input_stream: Option<cpal::Stream> = None;
             let mut rtp_receiver_stop: Option<Arc<Mutex<bool>>> = None;
@@ -91,11 +125,11 @@ impl AudioSystem {
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
                     AudioCommand::SetOutputDevice(name) => {
-                        ring_stream = None;
+                        active_stream = None;
                         call_output_stream = None;
-                        if let Some(name) = name {
+                        if let Some(ref n) = name {
                             output_device = host.output_devices().ok().and_then(|mut devices| {
-                                devices.find(|d| d.name().ok().as_deref() == Some(&name))
+                                devices.find(|d| d.name().ok().as_deref() == Some(n))
                             });
                         } else {
                             output_device = host.default_output_device();
@@ -104,48 +138,65 @@ impl AudioSystem {
                     }
                     AudioCommand::SetInputDevice(name) => {
                         call_input_stream = None;
-                        if let Some(name) = name {
+                        if let Some(ref n) = name {
                             input_device = host.input_devices().ok().and_then(|mut devices| {
-                                devices.find(|d| d.name().ok().as_deref() == Some(&name))
+                                devices.find(|d| d.name().ok().as_deref() == Some(n))
                             });
                         } else {
                             input_device = host.default_input_device();
                         }
                         info!("Audio input device set to: {:?}", input_device.as_ref().and_then(|d| d.name().ok()));
                     }
-                    AudioCommand::PlayRingtone => {
+                    AudioCommand::PlayRingtone | AudioCommand::PlayTestSound => {
+                        let is_test = matches!(cmd, AudioCommand::PlayTestSound);
                         if let Some(device) = &output_device {
                             if let Ok(config) = device.default_output_config() {
                                 let sample_rate = config.sample_rate().0 as f32;
                                 let channels = config.channels() as usize;
                                 let mut sample_clock = 0f32;
-                                let mut next_value = move || {
-                                    sample_clock = (sample_clock + 1.0) % sample_rate;
-                                    (sample_clock * 440.0 * 2.0 * std::f32::consts::PI / sample_rate).sin()
+                                let freq = if is_test { 880.0 } else { 440.0 };
+
+                                let stream_res = match config.sample_format() {
+                                    cpal::SampleFormat::F32 => device.build_output_stream(
+                                        &config.clone().into(),
+                                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                                            for frame in data.chunks_mut(channels) {
+                                                sample_clock = (sample_clock + 1.0) % sample_rate;
+                                                let value = (sample_clock * freq * 2.0 * std::f32::consts::PI / sample_rate).sin() * 0.5;
+                                                for sample in frame.iter_mut() { *sample = value; }
+                                            }
+                                        },
+                                        |err| error!("Audio stream error: {}", err),
+                                        None
+                                    ),
+                                    cpal::SampleFormat::I16 => device.build_output_stream(
+                                        &config.clone().into(),
+                                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                                            for frame in data.chunks_mut(channels) {
+                                                sample_clock = (sample_clock + 1.0) % sample_rate;
+                                                let value = (sample_clock * freq * 2.0 * std::f32::consts::PI / sample_rate).sin() * 0.5;
+                                                let s = (value * 32767.0) as i16;
+                                                for sample in frame.iter_mut() { *sample = s; }
+                                            }
+                                        },
+                                        |err| error!("Audio stream error: {}", err),
+                                        None
+                                    ),
+                                    _ => Err(cpal::BuildStreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "Unsupported format".to_string() } }),
                                 };
-                                let stream = device.build_output_stream(
-                                    &config.into(),
-                                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                        for frame in data.chunks_mut(channels) {
-                                            let value = next_value();
-                                            for sample in frame.iter_mut() { *sample = value * 0.5; }
-                                        }
-                                    },
-                                    |err| error!("Audio stream error: {}", err),
-                                    None
-                                );
-                                if let Ok(s) = stream {
-                                    if let Ok(_) = s.play() {
-                                        ring_stream = Some(s);
-                                        info!("Ringtone started");
+
+                                if let Ok(s) = stream_res {
+                                    if s.play().is_ok() {
+                                        active_stream = Some(s);
+                                        info!("{} started", if is_test { "Test sound" } else { "Ringtone" });
                                     }
                                 }
                             }
                         }
                     }
-                    AudioCommand::StopRingtone => {
-                        ring_stream = None;
-                        info!("Ringtone stopped");
+                    AudioCommand::StopRingtone | AudioCommand::StopTestSound => {
+                        active_stream = None;
+                        info!("Sound stopped");
                     }
                     AudioCommand::StartCallAudio { remote_rtp, local_port } => {
                         info!("Starting call audio: Local port {}, Remote RTP {}", local_port, remote_rtp);
@@ -158,11 +209,10 @@ impl AudioSystem {
                             }
                         };
 
-                        let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(8000 * 2))); // 2 seconds buffer
+                        let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(8000 * 2)));
                         let stop_flag = Arc::new(Mutex::new(false));
                         rtp_receiver_stop = Some(stop_flag.clone());
 
-                        // 1. Network Receiver Task
                         let socket_recv = socket.clone();
                         let jb_recv = jitter_buffer.clone();
                         let stop_recv = stop_flag.clone();
@@ -182,41 +232,19 @@ impl AudioSystem {
                             }
                         });
 
-                        // 2. Output stream (Buffer -> Speaker)
                         if let Some(device) = &output_device {
                             if let Ok(config) = device.default_output_config() {
-                                let channels = config.channels() as usize;
-                                let target_rate = config.sample_rate().0 as f32;
-                                let jb_out = jitter_buffer.clone();
-                                let mut resampler = Resampler::new(8000.0, target_rate);
-
-                                let stream = device.build_output_stream(
-                                    &config.into(),
-                                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                        let samples_needed = data.len() / channels;
-                                        // We need enough source samples to produce samples_needed at target rate
-                                        let source_needed = (samples_needed as f32 * (8000.0 / target_rate)).ceil() as usize + 5;
-
-                                        let source_samples = jb_out.lock().unwrap().pop(source_needed);
-                                        let mut resampled = vec![0.0f32; samples_needed];
-                                        resampler.resample(&source_samples, &mut resampled);
-
-                                        for (i, frame) in data.chunks_mut(channels).enumerate() {
-                                            let s = if i < resampled.len() { resampled[i] * 0.8 } else { 0.0 };
-                                            for sample in frame.iter_mut() { *sample = s; }
-                                        }
-                                    },
-                                    |err| error!("Output audio stream error: {}", err),
-                                    None
-                                );
-                                if let Ok(s) = stream {
-                                    s.play().ok();
-                                    call_output_stream = Some(s);
+                                let stream_res = match config.sample_format() {
+                                    cpal::SampleFormat::F32 => build_output_stream::<f32>(device, &config.clone().into(), jitter_buffer.clone(), 8000.0),
+                                    cpal::SampleFormat::I16 => build_output_stream::<i16>(device, &config.clone().into(), jitter_buffer.clone(), 8000.0),
+                                    _ => Err(cpal::BuildStreamError::BackendSpecific { err: cpal::BackendSpecificError { description: "Unsupported format".to_string() } }),
+                                };
+                                if let Ok(s) = stream_res {
+                                    if s.play().is_ok() { call_output_stream = Some(s); }
                                 }
                             }
                         }
 
-                        // 3. Input stream (Microphone -> Network)
                         if let Some(device) = &input_device {
                             if let Ok(config) = device.default_input_config() {
                                 let socket_in = socket.clone();
@@ -226,43 +254,43 @@ impl AudioSystem {
                                 let source_rate = config.sample_rate().0 as f32;
                                 let mut resampler = Resampler::new(source_rate, 8000.0);
 
-                                let stream = device.build_input_stream(
+                                let stream_res = device.build_input_stream(
                                     &config.into(),
                                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                                         let mut mono = Vec::with_capacity(data.len() / channels);
-                                        for frame in data.chunks(channels) {
-                                            mono.push(frame[0]);
-                                        }
+                                        for frame in data.chunks(channels) { mono.push(frame[0]); }
 
-                                        // Produce 160 samples (20ms) blocks
-                                        let mut resampled = vec![0.0f32; 160];
+                                        let mut resampled = vec![0.0f32; 1000];
                                         let (_, count) = resampler.resample(&mono, &mut resampled);
 
-                                        if count >= 160 {
-                                            let mut payload = Vec::with_capacity(160);
-                                            for i in 0..160 {
-                                                payload.push(G711::linear_to_ulaw((resampled[i] * 32767.0) as i16));
+                                        if count > 0 {
+                                            for chunk in resampled[..count].chunks(160) {
+                                                if chunk.len() == 160 {
+                                                    let mut payload = Vec::with_capacity(160);
+                                                    for &s in chunk {
+                                                        payload.push(G711::linear_to_ulaw((s * 32767.0) as i16));
+                                                    }
+                                                    let header = RtpHeader::new(0, seq, ts, 0x12345678);
+                                                    let packet = RtpPacket::new(header, payload);
+                                                    socket_in.send_to(&packet.to_bytes(), remote_rtp).ok();
+                                                    seq = seq.wrapping_add(1);
+                                                    ts = ts.wrapping_add(160);
+                                                }
                                             }
-                                            let header = RtpHeader::new(0, seq, ts, 0x12345678);
-                                            let packet = RtpPacket::new(header, payload);
-                                            socket_in.send_to(&packet.to_bytes(), remote_rtp).ok();
-                                            seq = seq.wrapping_add(1);
-                                            ts = ts.wrapping_add(160);
                                         }
                                     },
                                     |err| error!("Input audio stream error: {}", err),
                                     None
                                 );
-                                if let Ok(s) = stream {
-                                    s.play().ok();
-                                    call_input_stream = Some(s);
+                                if let Ok(s) = stream_res {
+                                    if s.play().is_ok() { call_input_stream = Some(s); }
                                 }
                             }
                         }
                     }
                     AudioCommand::StopCallAudio => {
                         if let Some(stop) = rtp_receiver_stop.take() {
-                            *stop.lock().unwrap() = true;
+                            if let Ok(mut s) = stop.lock() { *s = true; }
                         }
                         call_output_stream = None;
                         call_input_stream = None;
@@ -270,6 +298,9 @@ impl AudioSystem {
                     }
                 }
             }
+            drop(active_stream);
+            drop(call_output_stream);
+            drop(call_input_stream);
         });
 
         Self { tx }
@@ -289,6 +320,14 @@ impl AudioSystem {
 
     pub fn stop_ringtone(&self) {
         let _ = self.tx.send(AudioCommand::StopRingtone);
+    }
+
+    pub fn play_test_sound(&self) {
+        let _ = self.tx.send(AudioCommand::PlayTestSound);
+    }
+
+    pub fn stop_test_sound(&self) {
+        let _ = self.tx.send(AudioCommand::StopTestSound);
     }
 
     pub fn start_call_audio(&self, remote_rtp: SocketAddr, local_port: u16) {
