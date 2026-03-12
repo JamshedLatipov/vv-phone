@@ -4,6 +4,7 @@ use softphone::sip::ua::{UserAgent, RegistrationState, Call};
 use softphone::sip::SipMessage;
 use softphone::cli::Cli;
 use softphone::ui::{SoftphoneApp, UiCommand};
+use softphone::media::audio::AudioSystem;
 use clap::Parser;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex as TokioMutex;
@@ -52,6 +53,11 @@ async fn main() -> anyhow::Result<()> {
 
     let reg_state = Arc::new(StdMutex::new(RegistrationState::Unregistered));
     let active_calls = Arc::new(StdMutex::new(Vec::<Call>::new()));
+    let audio_system = Arc::new(AudioSystem::new());
+
+    // Set initial audio device
+    audio_system.set_output_device(config.audio.output_device.clone());
+
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
 
     let ua = Arc::new(TokioMutex::new(UserAgent::new(initial_account.clone(), transport.clone())));
@@ -86,14 +92,17 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Background task for command handling
+    let audio_system_cmd = audio_system.clone();
     tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let ua = ua.clone();
             let reg_state = reg_state.clone();
             let active_calls = active_calls.clone();
+            let audio_system = audio_system_cmd.clone();
 
             match cmd {
                 UiCommand::SaveConfig(new_config) => {
+                    audio_system.set_output_device(new_config.audio.output_device.clone());
                     if let Err(e) = new_config.save_to_file("config.toml") {
                         error!("Failed to save config: {}", e);
                     } else {
@@ -125,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 UiCommand::Invite(mut uri) => {
+                    let audio_invite = audio_system.clone();
                     tokio::spawn(async move {
                         let target_addr;
                         {
@@ -148,9 +158,17 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Some(addr) = target_addr {
                             let mut ua_lock = ua.lock().await;
+
+                            // Play ringing sound
+                            audio_invite.play_ringtone();
+
                             if let Err(e) = ua_lock.invite(&uri, addr).await {
                                 error!("Invite error: {}", e);
                             }
+
+                            // Stop ringing sound
+                            audio_invite.stop_ringtone();
+
                             let mut calls = active_calls.lock().unwrap();
                             *calls = ua_lock.active_calls.clone();
                         }

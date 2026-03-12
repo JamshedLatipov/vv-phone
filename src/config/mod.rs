@@ -30,10 +30,26 @@ impl Default for ConnectionSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioSettings {
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            input_device: None,
+            output_device: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub accounts: Vec<Account>,
     pub connection: ConnectionSettings,
+    pub audio: AudioSettings,
 }
 
 impl Config {
