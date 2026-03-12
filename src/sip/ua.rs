@@ -1,5 +1,5 @@
 use crate::core::{Account, CallState};
-use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage, SipResponse};
+use crate::sip::{SipRequest, Method, SipHeaderAccess, SipMessage};
 use crate::sip::transport::SipTransport;
 use crate::sip::auth::{calculate_digest_response, calculate_digest_response_qop};
 use crate::media::sdp::{SdpSession, SdpMediaDescription};
@@ -66,6 +66,10 @@ impl UserAgent {
         format!("{}:{}", local_ip, port)
     }
 
+    fn new_branch(&self) -> String {
+        format!("z9hG4bK-{}", Uuid::new_v4())
+    }
+
     pub async fn register(&mut self, server_addr: SocketAddr) -> Result<()> {
         self.reg_state = RegistrationState::Registering;
         info!("Registration started for {}", self.account.username);
@@ -74,8 +78,9 @@ impl UserAgent {
         let local_addr = self.get_public_local_addr(server_addr);
         let proto = self.transport.protocol();
 
+        self.cseq += 1;
         let req = SipRequest::new(Method::Register, &uri)
-            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-register-{}", proto, local_addr, Uuid::new_v4()))
+            .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, Uuid::new_v4()))
             .with_header("To", &format!("<sip:{}@{}>", self.account.username, self.account.domain))
             .with_header("Call-ID", &self.call_id)
@@ -129,6 +134,7 @@ impl UserAgent {
 
                     self.cseq += 1;
                     let auth_req = req.clone()
+                        .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
                         .with_header("CSeq", &format!("{} REGISTER", self.cseq))
                         .with_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
 
@@ -180,7 +186,7 @@ impl UserAgent {
         let sdp_str = sdp.to_string();
 
         let mut req = SipRequest::new(Method::Invite, remote_uri)
-            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-invite-{}", proto, local_addr, Uuid::new_v4()))
+            .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, local_tag))
             .with_header("To", &format!("<{}>", remote_uri))
             .with_header("Call-ID", &call_id)
@@ -195,17 +201,19 @@ impl UserAgent {
         info!("Sending INVITE to {} for {}", server_addr, remote_uri);
         self.transport.send_to(req.to_string().as_bytes(), server_addr).await?;
 
-        self.active_calls.push(Call {
+        let mut call = Call {
             id: call_id.clone(),
             state: CallState::Calling,
             remote_uri: remote_uri.to_string(),
             local_tag,
             remote_tag: None,
             remote_contact: None,
-        });
+        };
+        self.active_calls.push(call.clone());
 
         // Wait for response and handle auth challenges
         let mut buf = [0u8; 4096];
+        let mut retry_count = 0;
         loop {
             let (len, _addr) = match timeout(Duration::from_secs(10), self.transport.recv_from(&mut buf)).await {
                 Ok(res) => res?,
@@ -216,18 +224,22 @@ impl UserAgent {
             };
             let resp_str = String::from_utf8_lossy(&buf[..len]);
             if let Some(SipMessage::Response(res)) = SipMessage::parse(&resp_str) {
+                // Filter by Call-ID
+                if let Some(cid) = res.get_header("Call-ID") {
+                    if cid != &call_id { continue; }
+                } else {
+                    continue;
+                }
+
                 info!("Received {} {} for INVITE", res.status_code, res.reason);
 
                 let r_tag = res.get_header("To").and_then(|h| extract_tag(h));
                 let r_contact = res.get_header("Contact").map(|h| h.trim_matches(|c| c == '<' || c == '>').to_string());
 
                 if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
-                    if r_tag.is_some() {
-                        self.active_calls[pos].remote_tag = r_tag.clone();
-                    }
-                    if r_contact.is_some() {
-                        self.active_calls[pos].remote_contact = r_contact.clone();
-                    }
+                    if let Some(tag) = r_tag.clone() { self.active_calls[pos].remote_tag = Some(tag); }
+                    if let Some(contact) = r_contact.clone() { self.active_calls[pos].remote_contact = Some(contact); }
+                    call = self.active_calls[pos].clone();
                 }
 
                 if res.status_code == 100 || res.status_code == 180 || res.status_code == 183 {
@@ -240,13 +252,12 @@ impl UserAgent {
                 }
                 if res.status_code == 200 {
                     if let Some(pos) = self.active_calls.iter().position(|c| c.id == call_id) {
-                        let call = self.active_calls[pos].clone();
                         self.active_calls[pos].state = CallState::Connected;
+                        call = self.active_calls[pos].clone();
 
-                        // Send ACK
                         let ack_uri = call.remote_contact.as_ref().unwrap_or(&call.remote_uri);
                         let ack = SipRequest::new(Method::Ack, ack_uri)
-                            .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-ack-{}", proto, local_addr, Uuid::new_v4()))
+                            .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
                             .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, call.local_tag))
                             .with_header("To", &format!("<{}>;tag={}", call.remote_uri, call.remote_tag.as_deref().unwrap_or("")))
                             .with_header("Call-ID", &call.id)
@@ -258,7 +269,8 @@ impl UserAgent {
                     }
                     break;
                 }
-                if res.status_code == 401 || res.status_code == 407 {
+                if (res.status_code == 401 || res.status_code == 407) && retry_count < 3 {
+                    retry_count += 1;
                     let auth_header_name = if res.status_code == 401 { "WWW-Authenticate" } else { "Proxy-Authenticate" };
                     if let Some(authenticate) = res.get_header(auth_header_name) {
                         let realm = authenticate.split("realm=\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("");
@@ -282,11 +294,12 @@ impl UserAgent {
                         }
 
                         self.cseq += 1;
-                        let auth_req = req.clone()
-                            .with_header("CSeq", &format!("{} INVITE", self.cseq))
-                            .with_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
+                        let mut auth_req = req.clone();
+                        auth_req.set_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()));
+                        auth_req.set_header("CSeq", &format!("{} INVITE", self.cseq));
+                        auth_req.set_header(if res.status_code == 401 { "Authorization" } else { "Proxy-Authorization" }, &auth_val);
 
-                        info!("Retrying INVITE with auth to {}", server_addr);
+                        info!("Retrying INVITE with auth (retry {}) to {}", retry_count, server_addr);
                         self.transport.send_to(auth_req.to_string().as_bytes(), server_addr).await?;
                         continue;
                     }
@@ -313,7 +326,7 @@ impl UserAgent {
 
             let bye_uri = call.remote_contact.as_ref().unwrap_or(&call.remote_uri);
             let req = SipRequest::new(Method::Bye, bye_uri)
-                .with_header("Via", &format!("SIP/2.0/{} {};branch=z9hG4bK-bye-{}", proto, local_addr, Uuid::new_v4()))
+                .with_header("Via", &format!("SIP/2.0/{} {};branch={}", proto, local_addr, self.new_branch()))
                 .with_header("From", &format!("<sip:{}@{}>;tag={}", self.account.username, self.account.domain, call.local_tag))
                 .with_header("To", &format!("<{}>;tag={}", call.remote_uri, call.remote_tag.as_deref().unwrap_or("")))
                 .with_header("Call-ID", &call.id)

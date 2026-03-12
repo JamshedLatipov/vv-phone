@@ -157,21 +157,12 @@ impl SipRequest {
 
     pub fn to_string(&self) -> String {
         let mut s = format!("{} {} {}\r\n", self.method, self.uri, self.version);
-        let mut has_content_length = false;
         for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case("Content-Length") {
-                has_content_length = true;
-            }
             s.push_str(&format!("{}: {}\r\n", k, v));
         }
-        if !has_content_length {
-            s.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
-        }
         s.push_str("\r\n");
-        if !self.body.is_empty() {
-            let body_str = String::from_utf8_lossy(&self.body).to_string();
-            s.push_str(&body_str);
-        }
+        let body_str = String::from_utf8_lossy(&self.body).to_string();
+        s.push_str(&body_str);
         s
     }
 
@@ -223,21 +214,12 @@ impl SipResponse {
 
     pub fn to_string(&self) -> String {
         let mut s = format!("{} {} {}\r\n", self.version, self.status_code, self.reason);
-        let mut has_content_length = false;
         for (k, v) in &self.headers {
-            if k.eq_ignore_ascii_case("Content-Length") {
-                has_content_length = true;
-            }
             s.push_str(&format!("{}: {}\r\n", k, v));
         }
-        if !has_content_length {
-            s.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
-        }
         s.push_str("\r\n");
-        if !self.body.is_empty() {
-            let body_str = String::from_utf8_lossy(&self.body).to_string();
-            s.push_str(&body_str);
-        }
+        let body_str = String::from_utf8_lossy(&self.body).to_string();
+        s.push_str(&body_str);
         s
     }
 
@@ -345,7 +327,6 @@ mod tests {
         let s = req.to_string();
         assert!(s.contains("INVITE sip:alice@atlanta.com SIP/2.0"));
         assert!(s.contains("From: sip:bob@biloxi.com"));
-        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
@@ -366,7 +347,6 @@ mod tests {
         let s = res.to_string();
         assert!(s.contains("SIP/2.0 200 OK"));
         assert!(s.contains("To: sip:alice@atlanta.com"));
-        assert!(s.contains("Content-Length: 0"));
     }
 
     #[test]
@@ -394,17 +374,5 @@ mod tests {
             SipMessage::Response(res) => assert_eq!(res.status_code, 200),
             _ => panic!("Expected Response"),
         }
-    }
-}
-#[cfg(test)]
-mod tests_extra {
-    use crate::sip::*;
-
-    #[test]
-    fn test_content_length_auto_addition() {
-        let mut req = SipRequest::new(Method::Invite, "sip:bob@biloxi.com");
-        req.body = b"v=0\r\no=alice 2890844526 2890844526 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n".to_vec();
-        let s = req.to_string();
-        assert!(s.contains(&format!("Content-Length: {}\r\n", req.body.len())));
     }
 }
